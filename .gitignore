@@ -1,0 +1,14 @@
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
+*.snap
+.coverage
+htmlcov/
+# snapcraft work directories, when built without LXD
+/parts/
+/stage/
+/prime/
+*.pyc

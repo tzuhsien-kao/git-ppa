@@ -1,0 +1,106 @@
+name: git-ppa
+base: core26
+adopt-info: git-ppa
+summary: Keep a downstream PPA delta current with the Ubuntu archive
+license: GPL-3.0-or-later
+description: |
+  git-ppa treats the Ubuntu archive as the upstream and a Launchpad PPA as the
+  downstream. It finds the newest version in the Release, Security and Updates
+  pockets, merges it into the downstream git branch, classifies the result by
+  conflict size and by the regions it touched, and checks packaging rules.
+
+  Everything specific to a project (package names, branches, PPAs, risk
+  patterns, lint rules) comes from a profile file that you pass with
+  --profile, so the tool itself is not tied to one project.
+
+  Run it as "git ppa <command>" or "git-ppa <command>". Use "-h" for help,
+  "git ppa --help" is intercepted by git.
+
+  The snap is strict and reaches the private downstream repositories over https. Create a
+  Launchpad access token with the repository:pull scope for the project and store it with
+  "git ppa login".
+
+grade: devel
+confinement: strict
+
+platforms:
+  amd64:
+
+apps:
+  git-ppa:
+    # -I ignores PYTHON* variables and the user site of the host, the snap must run on its own code
+    command: bin/python3 -I -m git_ppa
+    plugs:
+      # api.launchpad.net and git.launchpad.net
+      - network
+      # the repositories you work in, hidden directories excluded
+      - home
+
+parts:
+  git-ppa:
+    plugin: python
+    source: .
+    stage-packages:
+      # core26 has no Python, the interpreter must be staged and listed one by one
+      - python3.14-minimal
+      - libpython3.14-minimal
+      - libpython3.14-stdlib
+      - python3.14
+      - python3-venv
+      # everything the tool runs is in the snap, a strict snap cannot reach the host's programs. There is no ssh client, the downstream is read over https with an access token.
+      # git also brings perl, which dpkg-mergechangelogs below needs.
+      - git
+    override-pull: |
+      craftctl default
+      craftctl set version="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -n1)"
+    prime:
+      - -usr/share/doc
+      - -usr/share/man
+      - -usr/share/lintian
+      - -usr/share/bash-completion
+      - -usr/share/gitweb
+      - -usr/share/perl/*/pod
+      - -usr/share/perl/*/unicore/To
+      - -usr/lib/git-core/mergetools
+      # build tools of the venv, git_ppa and python-debian only need to be imported
+      - -bin/pip*
+      - -bin/wheel
+      - -bin/activate*
+      - -bin/Activate.ps1
+      - -lib/python3*/site-packages/pip*
+      - -lib/python3*/site-packages/setuptools*
+      - -lib/python3*/site-packages/wheel*
+      - -lib/python3*/site-packages/pkg_resources*
+      - -lib/python3*/site-packages/_distutils_hack
+      - -lib/python3*/site-packages/distutils-precedence.pth
+      # parts of the staged standard library that nothing imports at run time
+      - -usr/share/python-wheels
+      - -usr/lib/python3*/test
+      - -usr/lib/python3*/pydoc_data
+      - -usr/lib/python3*/ensurepip
+      - -usr/lib/python3*/idlelib
+      # perl is only here for dpkg-mergechangelogs, the CPAN, ExtUtils, Module and Pod modules are not
+      - -usr/bin/cpan*
+      - -usr/bin/perl[a-z]*
+      - -usr/bin/pod*
+      - -usr/share/perl/*/CPAN*
+      - -usr/share/perl/*/ExtUtils
+      - -usr/share/perl/*/Module
+      - -usr/share/perl/*/Pod
+
+  changelog-merge:
+    # dpkg-mergechangelogs is in dpkg-dev, which pulls in a toolchain that is left out here
+    plugin: nil
+    stage-packages:
+      - dpkg-dev
+      - libdpkg-perl
+    override-build: |
+      craftctl default
+      # Dpkg::Vendor wants /etc/dpkg/origins/default, a strict snap cannot read the base's
+      mkdir -p "${CRAFT_PART_INSTALL}/usr/share/dpkg-origins"
+      printf 'Vendor: Ubuntu\nVendor-URL: https://www.ubuntu.com/\nParent: Debian\n' > "${CRAFT_PART_INSTALL}/usr/share/dpkg-origins/default"
+    stage:
+      - usr/bin/dpkg-mergechangelogs
+      - usr/share/perl5/Dpkg.pm
+      - usr/share/perl5/Dpkg
+      - usr/share/dpkg-origins

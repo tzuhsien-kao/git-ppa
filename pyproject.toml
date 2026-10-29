@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "git-ppa"
+version = "0.0.1"
+description = "Keep a downstream PPA delta current with the Ubuntu archive"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = ["python-debian"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+git-ppa = "git_ppa.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
