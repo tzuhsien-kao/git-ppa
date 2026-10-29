@@ -11,25 +11,29 @@ Everything specific to a project (package names, branches, PPAs, risk patterns, 
 a profile file that you pass with `--profile`, so the tool itself is not tied to one project.
 
 **Status: prototype, phase 1.** The commands below only read from Launchpad and write to your local
-clones. Nothing is pushed, uploaded or published yet.
+clones. Nothing is pushed to Launchpad, uploaded or published by the tool.
 
 ## Install
 
 As a snap (strict confinement, git and `dpkg-mergechangelogs` are inside):
 
 ```
-sudo snap install git-ppa
+sudo snap install git-ppa --edge
 ```
 
-Until it is published, install a local build with `sudo snap install --dangerous git-ppa_*.snap`.
-The snap can only write to non-hidden files and directories under your home directory, so work in a
-directory there (not `/tmp`).
+The snap is on the `edge` channel only for now. It reaches Launchpad over https, so a downstream
+that needs credentials must be read with an access token (see "Private repositories"), and it can
+only write to non-hidden files and directories under your home directory, so work in a directory
+there (not `/tmp`). To try a local build instead: `sudo snap install --dangerous git-ppa_*.snap`.
 
-From a checkout (needs `git` and `dpkg-dev` on the host):
+From a checkout (needs `git`, `dpkg-dev` and `ssh` on the host):
 
 ```
 python3 -m venv .venv && .venv/bin/pip install -e '.[test]'
 ```
+
+A checkout uses the host's git and ssh, so a profile with a `git+ssh://{lpuser}@git.launchpad.net/...`
+repository URL works there with your ssh key and agent, without any token.
 
 Run it as `git-ppa <command>` or `git ppa <command>`. Use `-h` for help, `git ppa --help` is
 intercepted by git.
@@ -106,6 +110,16 @@ refuses is not deleted.
 
 In CI, set `GIT_PPA_TOKEN` and `GIT_PPA_LPUSER`. One token then answers for every repository on
 `git.launchpad.net`, and nothing is written to disk.
+
+## Known limits
+
+- Launchpad errors that go away on their own (an https 502, an ssh connection closed) are not
+  retried, run the command again. Over `git+ssh` Launchpad refuses several parallel connections,
+  use `status --jobs 1`.
+- `status` skips the base version of packages marked `large` in the profile, add `--include-large`
+  to read them, the first fetch is slow.
+- `merge start` leaves a conflicted tree for you to resolve. `merge finish`, building and uploading
+  are not implemented.
 
 ## Development
 
