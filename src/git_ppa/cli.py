@@ -133,30 +133,90 @@ def _login_targets(args: argparse.Namespace, prof: profile_mod.Profile, user: st
     return [(n, prof.downstream_url(prof.package(n), user)) for n in names]
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    seen: dict = {}
+    for k, v in pairs:
+        if k in seen:
+            raise CliError(f"{k!r} appears twice")
+        seen[k] = v
+    return seen
+
+
+def _read_tokens(source: str, prof: profile_mod.Profile) -> list[tuple[str, str]]:
+    """A JSON object of package name to token, `*` is a token for every package not named.
+
+    `-` reads standard input, which is how a CI secret is passed without a file.
+    """
+    if source == "-":
+        text, where = sys.stdin.read(), "standard input"
+    else:
+        f = Path(source).expanduser()
+        if not f.is_file():
+            raise CliError(f"{f} is not a file")
+        if f.stat().st_mode & 0o077:
+            raise CliError(f"{f} can be read by other users, run `chmod 600 {f}` first")
+        text, where = f.read_text(), str(f)
+    try:
+        data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
+    except (json.JSONDecodeError, CliError) as e:
+        raise CliError(f"{where} is not a JSON object of package to token: {e}") from None
+    if not isinstance(data, dict) or not data:
+        raise CliError(f"{where} must be a JSON object of package to token, with at least one entry")
+    named: dict[str, str] = {}
+    fallback = None
+    for key, token in data.items():
+        if not isinstance(token, str) or not token.strip() or token != token.strip() or " " in token:
+            raise CliError(f"{where}: the token of {key!r} must be a non-empty string without spaces")
+        if key == "*":
+            fallback = token
+            continue
+        name = prof.package(key).name
+        if name in named:
+            raise CliError(f"{where}: {name} appears twice")
+        named[name] = token
+    if fallback:
+        for name in prof.packages:
+            named.setdefault(name, fallback)
+    return list(named.items())
+
+
+def _keep_if_it_reads(name: str, url: str, token: str, user: str, verify: bool) -> bool:
+    """Store the token for one repository, keep it only if the repository can be read with it."""
+    repo = credentials.repo_path(url)
+    before = credentials.snapshot()
+    credentials.save(user, token, repo)
+    if not verify:
+        print(f"{name}: token saved, not verified")
+        return True
+    p = gitutil.run("ls-remote", "--heads", url, check=False)
+    if p.returncode == 0:
+        print(f"{name}: token saved and verified")
+        return True
+    credentials.remove([repo])
+    if repo in before:
+        credentials.restore({repo: before[repo]})
+    lines = p.stderr.strip().splitlines()
+    print(f"{name}: token refused, not kept ({lines[-1] if lines else p.returncode})", file=sys.stderr)
+    return False
+
+
 def cmd_login(args: argparse.Namespace) -> int:
     prof = _profile(args)
     user = _lpuser(args)
-    targets = _login_targets(args, prof, user)
-    token = os.environ.get("GIT_PPA_TOKEN") or (
-        getpass.getpass(f"Launchpad access token for {', '.join(n for n, _ in targets)} ({user}): ")
-        if sys.stdin.isatty() else sys.stdin.readline()
-    ).strip()
-    if not token:
-        raise CliError("no token, type it at the prompt or pipe it in")
-    failed = 0
-    for name, url in targets:
-        credentials.save(user, token, credentials.repo_path(url))
-        if args.no_verify:
-            print(f"{name}: token saved, not verified")
-            continue
-        p = gitutil.run("ls-remote", "--heads", url, check=False)
-        if p.returncode != 0:
-            credentials.remove([credentials.repo_path(url)])
-            lines = p.stderr.strip().splitlines()
-            print(f"{name}: token refused, not kept ({lines[-1] if lines else p.returncode})", file=sys.stderr)
-            failed += 1
-        else:
-            print(f"{name}: token saved and verified")
+    if args.from_file:
+        if args.packages or args.all:
+            raise CliError("--from-file takes the package names from the file")
+        work = [(n, prof.downstream_url(prof.package(n), user), t) for n, t in _read_tokens(args.from_file, prof)]
+    else:
+        targets = _login_targets(args, prof, user)
+        token = os.environ.get("GIT_PPA_TOKEN") or (
+            getpass.getpass(f"Launchpad access token for {', '.join(n for n, _ in targets)} ({user}): ")
+            if sys.stdin.isatty() else sys.stdin.readline()
+        ).strip()
+        if not token:
+            raise CliError("no token, type it at the prompt or pipe it in")
+        work = [(n, u, token) for n, u in targets]
+    failed = sum(not _keep_if_it_reads(n, u, t, user, not args.no_verify) for n, u, t in work)
     print(f"tokens are kept in {credentials.path()}")
     return 1 if failed else 0
 
@@ -253,6 +313,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = add("login", "store a Launchpad access token for the repositories of some packages")
     s.add_argument("packages", nargs="*", help="a token made for one repository covers one package")
     s.add_argument("--all", action="store_true", help="the token covers every package of the profile (a project token)")
+    s.add_argument("--from-file", metavar="FILE", help="read a JSON object of package to token from FILE (mode 600), or from standard input with -")
     s.add_argument("--no-verify", action="store_true", help="do not try the token on the repositories")
     s.set_defaults(func=cmd_login)
 

@@ -67,6 +67,18 @@ def save(user: str, token: str, repo: str) -> Path:
     return path()
 
 
+def snapshot() -> dict[str, str]:
+    return _entries()
+
+
+def restore(entries: dict[str, str]) -> None:
+    """Put back the lines of repositories as they were, used when a new token turns out to be refused."""
+    current = _entries()
+    for repo, line in entries.items():
+        current[repo] = line
+    _write(current)
+
+
 def stored() -> list[str]:
     return sorted(_entries())
 

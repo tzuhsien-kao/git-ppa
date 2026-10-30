@@ -48,7 +48,7 @@ intercepted by git.
 | `merge start [package]` | Merge the archive import tag into the downstream branch on a staging branch, report the tier (mechanical, ai-assisted, re-port) and the risk, leave conflicts in the tree |
 | `lint [package]` | Check the packaging rules the profile enables |
 | `orig [package]` | Fetch the orig tarball of the base version from Launchpad, verify its checksum, and name it for the downstream source |
-| `login [package...]` | Store a Launchpad access token for private repositories |
+| `login [package...]` | Store a Launchpad access token for private repositories, one at a prompt, or many from a JSON file or standard input with `--from-file` |
 | `logout [package...]` | Remove stored tokens |
 
 Global options: `--profile FILE` (or `GIT_PPA_PROFILE`), `--series`, `--lpuser` (or
@@ -103,13 +103,39 @@ Create a token with the `repository:pull` scope on the repository's "Manage acce
 git ppa login --lpuser <you> <package>
 ```
 
-A token is made for one repository, so each package needs its own, unless you have a project token
-(then `git ppa login --all`). Tokens are kept in a file readable only by you and handed to git
-through a credential helper, never on a command line or in a remote URL. A token that Launchpad
-refuses is not deleted.
+A token is made for one repository, so each package needs its own, unless you have a project token.
 
-In CI, set `GIT_PPA_TOKEN` and `GIT_PPA_LPUSER`. One token then answers for every repository on
-`git.launchpad.net`, and nothing is written to disk.
+### Many tokens at once
+
+Keep them in one JSON object of package to token. The key is a package name of the profile (or its
+Ubuntu source name), `*` is a token for every package that is not named:
+
+```json
+{
+  "hello-acme": "<token for hello-acme>",
+  "other-acme": "<token for other-acme>",
+  "*": "<project token, used for every package not named above>"
+}
+```
+
+A file or a CI secret has the same format. Import it:
+
+```
+git ppa login --lpuser <you> --from-file tokens.json      # a file, mode 600, outside hidden directories
+printf '%s\n' "$LP_TOKENS" | git ppa login --lpuser <you> --from-file -    # standard input, for CI
+```
+
+A duplicate key, a package the profile does not know, an empty token or a token with spaces rejects
+the whole input, nothing is imported half way. A file that other users can read is refused. Each
+token is tried on its repository and kept only if that works, and a refused token never replaces a
+working one. Delete the file afterwards. Tokens are then kept in a file readable only by you and
+handed to git through a credential helper, never on a command line or in a remote URL.
+
+### CI
+
+Put the JSON in one secret and import it with the `-` form above, or for one token that covers every
+repository set `GIT_PPA_TOKEN` and `GIT_PPA_LPUSER` and skip `login`, nothing is then written to disk.
+The snap can only read files under the home directory, so use a workspace there.
 
 ## Known limits
 

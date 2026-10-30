@@ -60,3 +60,83 @@ def test_login_keeps_one_token_per_package_and_logout_removes_them(tmp_path, mon
     assert credentials.stored() == ["~t/p/+git/b"]
     assert cli.main(["logout"]) == 0
     assert credentials.stored() == []
+
+
+def _login_profile(tmp_path, monkeypatch):
+    prof = tmp_path / "p.toml"
+    prof.write_text(
+        '[project]\ntag="x"\nseries=["s"]\n[repo]\nurl="https://git.launchpad.net/~t/p/+git/{name}"\nupstream_url="u"\n'
+        '[branches]\nmirror="m"\ndownstream="d"\nstaging="s"\n'
+        '[[package]]\nname="a"\narchive="src-a"\n[[package]]\nname="b"\narchive="b"\n'
+    )
+    monkeypatch.setenv("GIT_PPA_CREDENTIALS", str(tmp_path / "credentials"))
+    monkeypatch.setenv("GIT_PPA_PROFILE", str(prof))
+    monkeypatch.delenv("GIT_PPA_TOKEN", raising=False)
+
+
+def test_login_from_a_json_file_stores_one_token_per_package(tmp_path, monkeypatch, capsys):
+    from git_ppa import credentials
+    _login_profile(tmp_path, monkeypatch)
+    f = tmp_path / "tokens.json"
+    f.write_text('{"a": "tok-a", "b": "tok-b"}')
+    f.chmod(0o600)
+    assert cli.main(["login", "--lpuser", "me", "--no-verify", "--from-file", str(f)]) == 0
+    assert credentials.stored() == ["~t/p/+git/a", "~t/p/+git/b"]
+    out = capsys.readouterr()
+    assert "tok-a" not in out.out + out.err
+    text = (tmp_path / "credentials").read_text()
+    assert "me:tok-a@" in text and "me:tok-b@" in text
+
+
+def test_login_from_standard_input_and_the_star_token(tmp_path, monkeypatch):
+    import io
+    from git_ppa import credentials
+    _login_profile(tmp_path, monkeypatch)
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"*": "project", "b": "only-b"}\n'))
+    assert cli.main(["login", "--lpuser", "me", "--no-verify", "--from-file", "-"]) == 0
+    text = (tmp_path / "credentials").read_text()
+    assert "me:project@git.launchpad.net/~t/p/+git/a" in text
+    assert "me:only-b@git.launchpad.net/~t/p/+git/b" in text and "project@git.launchpad.net/~t/p/+git/b" not in text
+
+
+def test_login_from_a_file_refuses_a_readable_or_malformed_file(tmp_path, monkeypatch, capsys):
+    from git_ppa import credentials
+    _login_profile(tmp_path, monkeypatch)
+    f = tmp_path / "tokens.json"
+    f.write_text('{"a": "tok-a"}')
+    f.chmod(0o644)
+    assert cli.main(["login", "--lpuser", "me", "--no-verify", "--from-file", str(f)]) == 1
+    assert "chmod 600" in capsys.readouterr().err
+    f.chmod(0o600)
+    bad_inputs = (
+        ("a tok-a", "not a JSON object"),
+        ("[]", "must be a JSON object"),
+        ("{}", "at least one entry"),
+        ('{"a": "t1", "a": "t2"}', "appears twice"),
+        ('{"a": "t1", "src-a": "t2"}', "appears twice"),
+        ('{"nope": "t"}', "unknown package"),
+        ('{"a": 5}', "non-empty string"),
+        ('{"a": "two words"}', "without spaces"),
+        ('{"a": ""}', "non-empty string"),
+    )
+    for bad, why in bad_inputs:
+        f.write_text(bad)
+        assert cli.main(["login", "--lpuser", "me", "--no-verify", "--from-file", str(f)]) == 1
+        assert why in capsys.readouterr().err, bad
+    assert credentials.stored() == []
+
+
+def test_a_refused_token_keeps_the_token_that_was_there(tmp_path, monkeypatch, capsys):
+    from git_ppa import credentials, gitutil
+    import subprocess
+    _login_profile(tmp_path, monkeypatch)
+    credentials.save("me", "good", "~t/p/+git/a")
+    before = (tmp_path / "credentials").read_text()
+    refused = subprocess.CompletedProcess([], 128, "", "fatal: Authentication failed")
+    monkeypatch.setattr(gitutil, "run", lambda *a, **k: refused)
+    f = tmp_path / "tokens"
+    f.write_text('{"a": "bad", "b": "bad"}')
+    f.chmod(0o600)
+    assert cli.main(["login", "--lpuser", "me", "--from-file", str(f)]) == 1
+    assert (tmp_path / "credentials").read_text() == before
+    assert capsys.readouterr().err.count("token refused") == 2
