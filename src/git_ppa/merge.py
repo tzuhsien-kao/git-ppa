@@ -4,12 +4,19 @@
 from __future__ import annotations
 
 import difflib
+import email.utils
 import fnmatch
+import io
+import os
 import re
+import tarfile
+import tempfile
+import textwrap
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 
-from . import gitutil, versions, workspace
+from . import gitutil, lint, lp, versions, workspace
 from .profile import Caps, Package, Profile, Risk
 
 
@@ -317,8 +324,11 @@ def merge_start(profile: Profile, pkg: Package, series: str, repo: Path, target:
         raise Refused(f"no downstream branch {names['downstream']}")
     if gitutil.ok("merge-base", "--is-ancestor", target_sha, start, cwd=repo):
         raise UpToDate(f"{target} is already in {names['downstream']}")
-    old_top = _top_version(gitutil.show(start, "debian/changelog", repo))
-    base = versions.strip_suffix(old_top, profile.tag) if old_top else None
+    old_text = gitutil.show(start, "debian/changelog", repo)
+    old_top = _top_version(old_text)
+    base = versions.archive_base(old_text, pkg.archive, profile.tag) if old_text else None
+    if not base and old_top:
+        base = versions.strip_suffix(old_top, profile.tag)
     base_tag = workspace.import_tag(profile, base) if base else None
     base_sha = gitutil.rev(base_tag, repo) if base_tag else None
     if not base_sha:
@@ -400,6 +410,168 @@ def merge_start(profile: Profile, pkg: Package, series: str, repo: Path, target:
         tier=classify(conflicts, risk, profile.caps), warnings=warnings,
         resolved=resolved, build_system_other=build_other,
     )
+
+
+class LintFailed(Exception):
+    """merge finish found lint errors the downstream did not have before the merge. Exit code 1."""
+
+    def __init__(self, findings: list[lint.Finding]):
+        self.findings = findings
+        super().__init__(f"{len(findings)} new lint error(s), the changelog entry was not committed")
+
+
+@dataclass
+class Finish:
+    package: str
+    target: str
+    previous: str
+    version: str
+    kept_base: bool
+    entry: str
+    ppa: str | None
+    ppa_checked: bool
+    carried: list[str]
+    commit: str | None
+    warnings: list[str]
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+CVE = re.compile(r"CVE-\d{4}-\d{4,}")
+
+
+def _identity(profile: Profile, me: bool, repo: Path) -> tuple[str, str]:
+    if me:
+        name = os.environ.get("DEBFULLNAME") or gitutil.out("config", "user.name", cwd=repo, check=False)
+        email = os.environ.get("DEBEMAIL") or gitutil.out("config", "user.email", cwd=repo, check=False)
+        if not (name and email) or email.endswith("@localhost"):
+            raise Refused("--me needs DEBFULLNAME and DEBEMAIL, or a git user.name and user.email")
+        return name, email
+    if not (profile.changelog_name and profile.changelog_email):
+        raise Refused("the profile has no [changelog] name and email (the bot identity), use --me to sign as yourself")
+    return profile.changelog_name, profile.changelog_email
+
+
+def changelog_entry(source: str, version: str, series: str, bullets: list[str], name: str, email: str,
+                    when: datetime | None = None) -> str:
+    when = when or datetime.now().astimezone()
+    body = "".join(
+        textwrap.fill(b, width=79, initial_indent="  * ", subsequent_indent="    ") + "\n" for b in bullets
+    )
+    return f"{source} ({version}) {series}; urgency=medium\n\n{body}\n -- {name} <{email}>  {email_date(when)}\n\n"
+
+
+def email_date(when: datetime) -> str:
+    return email.utils.format_datetime(when)
+
+
+def _cves_between(changelog_text: str, archive: str, tag: str, old_base: str | None, target: str) -> list[str]:
+    from debian.changelog import Changelog
+    ids: set[str] = set()
+    for b in Changelog(changelog_text):
+        v = str(b.version)
+        if b.package != archive or versions.has_suffix(v, tag):
+            continue
+        if versions.gt(v, target) or (old_base and not versions.gt(v, old_base)):
+            continue
+        ids |= set(CVE.findall("\n".join(b.changes())))
+    return sorted(ids)
+
+
+def _lint_errors_at(ref: str, profile: Profile, pkg: Package, repo: Path) -> set[tuple[str, str]]:
+    """Lint errors of the debian/ directory of a commit. Python's tarfile, the snap's tar cannot extract."""
+    data = gitutil.run_bytes("archive", "--format=tar", ref, "debian", cwd=repo)
+    with tempfile.TemporaryDirectory() as tmp, tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        tar.extractall(tmp, filter="data")
+        return {(f.rule, f.message) for f in lint.run(Path(tmp), profile, pkg) if f.severity == "error"}
+
+
+def merge_finish(profile: Profile, pkg: Package, series: str, repo: Path, me: bool = False,
+                 dry_run: bool = False, skip_ppa_check: bool = False, when: datetime | None = None) -> Finish:
+    names = profile.names(pkg, series)
+    old_ref = f"old/{profile.tag}"
+    warnings: list[str] = []
+    if gitutil.current_branch(repo) != names["staging"]:
+        raise Refused(f"run merge finish on {names['staging']}, after merge start")
+    git_dir = Path(gitutil.out("rev-parse", "--absolute-git-dir", cwd=repo))
+    if (git_dir / "MERGE_HEAD").exists():
+        raise Refused("the merge is not committed, resolve the conflicts, commit, then run merge finish")
+    if not gitutil.is_clean(repo):
+        raise Refused("working tree is not clean")
+    for t in (old_ref, "new/ubuntu"):
+        if not gitutil.rev(t, repo):
+            raise Refused(f"no tag {t}, run merge start first")
+    if not gitutil.ok("merge-base", "--is-ancestor", "new/ubuntu", "HEAD", cwd=repo):
+        raise Refused("new/ubuntu is not merged into this branch")
+    old_text = gitutil.show(old_ref, "debian/changelog", repo)
+    previous = versions.newest_of(old_text, pkg.name) or versions.top_version(old_text) or ""
+    current = (repo / "debian/changelog").read_text(encoding="utf-8")
+    ours = versions.newest_of(current, pkg.name)
+    if ours and ours != previous:
+        raise Refused(f"there is already an entry {ours} after {previous}, merge finish was run")
+    target = versions.top_version(gitutil.show("new/ubuntu", "debian/changelog", repo)) or ""
+    old_base = versions.archive_base(old_text, pkg.archive, profile.tag)
+
+    ref = profile.ppa_reference(pkg)
+    used: set[str] = set()
+    if ref and not skip_ppa_check:
+        used = lp.ppa_versions(ref, pkg.name)
+    elif ref:
+        warnings.append(f"versions already used in {ref} were not checked (--skip-ppa-check)")
+    else:
+        warnings.append("the profile names no target PPA for this package, versions used there were not checked")
+    version, kept = versions.choose_version(target, previous, profile.tag, pkg.in_archive, used)
+
+    sep = "+" if pkg.in_archive else "~"
+    bullets = [f"Merge {target} from the Ubuntu archive."]
+    cves = _cves_between(current, pkg.archive, profile.tag, old_base, target)
+    if cves:
+        bullets.append("It includes the fixes for " + ", ".join(cves) + ".")
+    if kept:
+        bullets.append(f"The version keeps the base {versions.strip_suffix(version, profile.tag)}, "
+                       f"{target}{sep}{profile.tag}1 would sort below the previous version {previous}.")
+    name, mail = _identity(profile, me, repo)
+    entry = changelog_entry(pkg.name, version, series, bullets, name, mail, when)
+    result = Finish(pkg.name, target, previous, version, kept, entry, ref, bool(ref and not skip_ppa_check),
+                    [], None, warnings)
+    if dry_run:
+        return result
+
+    before = _lint_errors_at(old_ref, profile, pkg, repo)
+    (repo / "debian/changelog").write_text(entry + current, encoding="utf-8")
+    after = {(f.rule, f.message) for f in lint.run(repo, profile, pkg) if f.severity == "error"}
+    new = sorted(after - before)
+    if new:
+        gitutil.run("checkout", "--", "debian/changelog", cwd=repo)
+        raise LintFailed([lint.Finding(r, "error", m, "") for r, m in new])
+    result.carried = [f"[{r}] {m}" for r, m in sorted(after & before)]
+    gitutil.run("add", "debian/changelog", cwd=repo)
+    # the author is whoever signs the entry, --author wins over GIT_AUTHOR_* in the environment
+    gitutil.run("commit", "-q", f"--author={name} <{mail}>", "-m", f"{pkg.name} {version}", cwd=repo)
+    result.commit = (gitutil.rev("HEAD", repo) or "")[:12]
+    return result
+
+
+def render_finish(r: Finish) -> str:
+    lines = [
+        f"package   {r.package}",
+        f"merged    {r.target}",
+        f"previous  {r.previous}",
+        f"version   {r.version}" + ("   (keeps an older base, see the entry)" if r.kept_base else ""),
+        f"ppa       {r.ppa or '-'}" + ("" if r.ppa_checked or not r.ppa else "   (not checked)"),
+    ]
+    if r.commit:
+        lines.append(f"commit    {r.commit}")
+    else:
+        lines.append("dry run   nothing written")
+    for c in r.carried:
+        lines.append(f"carried   {c}   (already there before the merge)")
+    for w in r.warnings:
+        lines.append(f"warning   {w}")
+    lines.append("entry")
+    lines += ["  " + l if l else "" for l in r.entry.rstrip("\n").splitlines()]
+    return "\n".join(lines)
 
 
 def abort(profile: Profile, pkg: Package, series: str, repo: Path) -> list[str]:

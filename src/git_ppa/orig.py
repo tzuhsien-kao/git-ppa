@@ -12,7 +12,6 @@ import tempfile
 from pathlib import Path
 
 from debian import deb822
-from debian.changelog import Changelog
 
 from . import lp, versions
 from .profile import Package, Profile
@@ -32,8 +31,9 @@ def _sha256(p: Path) -> str:
 
 def fetch(profile: Profile, pkg: Package, series: str, repo: Path, outdir: Path, version: str | None = None) -> list[Path]:
     if version is None:
-        with (repo / "debian/changelog").open(encoding="utf-8") as f:
-            version = versions.strip_suffix(str(next(iter(Changelog(f))).version), profile.tag)
+        text = (repo / "debian/changelog").read_text(encoding="utf-8")
+        top = versions.top_version(text) or ""
+        version = versions.archive_base(text, pkg.archive, profile.tag) or versions.strip_suffix(top, profile.tag)
     pubs = [p for p in lp.published(pkg.archive, series, status=None) if p.version == version]
     if not pubs:
         raise OrigError(f"{pkg.archive} {version} is not published in {series}")

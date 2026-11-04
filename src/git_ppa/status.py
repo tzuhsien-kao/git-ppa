@@ -64,8 +64,8 @@ def clear_stale_locks(repo: Path, max_age: float = gitutil.TIMEOUT + 60) -> list
     return gone
 
 
-def downstream_top_version(profile: Profile, pkg: Package, series: str, lpuser: str, refresh: bool) -> str:
-    """Top version of debian/changelog on the downstream branch, through a shallow cached fetch."""
+def downstream_changelog(profile: Profile, pkg: Package, series: str, lpuser: str, refresh: bool) -> str:
+    """debian/changelog of the downstream branch, through a shallow cached fetch."""
     names = profile.names(pkg, series)
     ref = f"refs/heads/{names['downstream']}"
     url = profile.downstream_url(pkg, lpuser)
@@ -83,10 +83,9 @@ def downstream_top_version(profile: Profile, pkg: Package, series: str, lpuser: 
     if refresh or cached != sha:
         _bare(repo, "fetch", "--depth", "1", "--no-tags", "-q", url, f"+{ref}:refs/cache/tip")
     cl = _bare(repo, "show", "refs/cache/tip:debian/changelog", check=False)
-    m = TOP_RE.search(cl.stdout if cl.returncode == 0 else "")
-    if not m:
+    if cl.returncode != 0 or not TOP_RE.search(cl.stdout):
         raise gitutil.GitError(("show", "debian/changelog"), 2, "cannot read the top changelog entry")
-    return m.group(2)
+    return cl.stdout
 
 
 def one(profile: Profile, pkg: Package, series: str, lpuser: str, include_large: bool, refresh: bool) -> Row:
@@ -102,9 +101,10 @@ def one(profile: Profile, pkg: Package, series: str, lpuser: str, include_large:
         if pkg.large and not include_large:
             row.note = "base not read (large, use --include-large)"
             return row
-        top = downstream_top_version(profile, pkg, series, lpuser, refresh)
+        text = downstream_changelog(profile, pkg, series, lpuser, refresh)
+        top = versions.top_version(text) or ""
         row.downstream_version = top
-        row.base = versions.strip_suffix(top, profile.tag)
+        row.base = versions.archive_base(text, pkg.archive, profile.tag) or versions.strip_suffix(top, profile.tag)
         if followed:
             row.behind = versions.gt(followed.version, row.base)
             if row.behind:

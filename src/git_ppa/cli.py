@@ -116,6 +116,15 @@ def cmd_merge(args: argparse.Namespace) -> int:
         for line in merge.abort(prof, pkg, series, repo):
             print(line)
         return 0
+    if args.action == "finish":
+        try:
+            fin = merge.merge_finish(prof, pkg, series, repo, me=args.me, dry_run=args.dry_run, skip_ppa_check=args.skip_ppa_check)
+        except merge.LintFailed as e:
+            print(f"error: {e}", file=sys.stderr)
+            print(lint.render(e.findings), file=sys.stderr)
+            return 1
+        _emit(args, fin.to_dict(), merge.render_finish(fin))
+        return 0
     target = _target(prof, pkg, args, series)
     try:
         report = merge.merge_start(prof, pkg, series, repo, target, args.force)
@@ -303,11 +312,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_sync)
 
     s = add("merge", "merge an archive import tag into the downstream branch")
-    s.add_argument("action", choices=["start"])
+    s.add_argument("action", choices=["start", "finish"])
     s.add_argument("package", nargs="?")
     s.add_argument("--to", help="archive version, default is the newest followed")
     s.add_argument("--force", action="store_true", help="recreate the staging branch")
     s.add_argument("--abort", action="store_true", help="discard the staging branch and the merge tags")
+    s.add_argument("--dry-run", action="store_true", help="finish: show the version and the entry, write nothing")
+    s.add_argument("--me", action="store_true", help="finish: sign the entry with DEBFULLNAME and DEBEMAIL, not the bot identity of the profile")
+    s.add_argument("--skip-ppa-check", action="store_true", help="finish: do not read the versions already used in the target PPA")
     s.set_defaults(func=cmd_merge)
 
     s = add("login", "store a Launchpad access token for the repositories of some packages")

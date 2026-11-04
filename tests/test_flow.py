@@ -4,7 +4,7 @@
 import pytest
 
 from conftest import CHANGELOG_V1, CONTROL_V1, NEW_ENTRY, RULES_V1, commit, git, new_version, write
-from git_ppa import gitutil, merge, workspace
+from git_ppa import gitutil, merge, versions, workspace
 
 V2 = "1.0-1ubuntu1.1"
 
@@ -184,3 +184,109 @@ def test_series_resolved_but_another_file_still_conflicts(prof, tmp_path, world)
     assert not r.merged and len(r.resolved) == 1
     assert [c.path for c in r.conflicts] == ["debian/control"]
     assert (repo / "debian/patches/series").read_text() == "b.patch\nacme.patch\ncve-1.patch\n"
+
+
+def _finish_profile(prof, monkeypatch, used=frozenset()):
+    from git_ppa import lp
+    prof.changelog_name, prof.changelog_email = "Acme Bot", "bot@example.com"
+    prof.ppa_owner = "acme"
+    pkg = prof.package("hello-acme")
+    object.__setattr__(pkg, "ppa", "acme-proposed")
+    calls = []
+    monkeypatch.setattr(lp, "ppa_versions", lambda ref, name: calls.append((ref, name)) or set(used))
+    return pkg, calls
+
+
+def test_merge_finish_adds_the_entry_lints_and_commits(prof, tmp_path, world, monkeypatch):
+    pkg, repo = prepare(prof, tmp_path, world, {})
+    assert merge.merge_start(prof, pkg, "resolute", repo, V2).merged
+    _, calls = _finish_profile(prof, monkeypatch)
+    f = merge.merge_finish(prof, pkg, "resolute", repo)
+    assert calls == [("~acme/ubuntu/acme-proposed", "hello-acme")]
+    assert (f.target, f.previous, f.version, f.kept_base) == (V2, "1.0-1ubuntu1+acme1", "1.0-1ubuntu1.1+acme1", False)
+    top = (repo / "debian/changelog").read_text().splitlines()
+    assert top[0] == "hello-acme (1.0-1ubuntu1.1+acme1) resolute; urgency=medium"
+    assert "  * Merge 1.0-1ubuntu1.1 from the Ubuntu archive." in top
+    assert "  * It includes the fixes for CVE-2026-0001." in top
+    assert git(repo, "log", "-1", "--format=%an <%ae>|%s") == "Acme Bot <bot@example.com>|hello-acme 1.0-1ubuntu1.1+acme1"
+    assert gitutil.is_clean(repo) and f.commit
+    from git_ppa import lint
+    assert [x for x in lint.run(repo, prof, pkg) if x.severity == "error"] == []
+    with pytest.raises(merge.Refused, match="already an entry 1.0-1ubuntu1.1\\+acme1 after"):
+        merge.merge_finish(prof, pkg, "resolute", repo)
+
+
+def test_merge_finish_keeps_the_base_when_the_archive_appended_letters(prof, tmp_path, world, monkeypatch):
+    entry = NEW_ENTRY.replace("1.0-1ubuntu1.1", "1.0-1ubuntu1build1")
+    new_version(world, {"debian/changelog": entry + CHANGELOG_V1}, "1.0-1ubuntu1build1")
+    pkg = prof.package("hello-acme")
+    repo = workspace.clone(prof, pkg, "resolute", "lp", tmp_path / "ws")
+    workspace.sync_local(prof, pkg, "resolute", repo, "1.0-1ubuntu1build1")
+    assert merge.merge_start(prof, pkg, "resolute", repo, "1.0-1ubuntu1build1").merged
+    _finish_profile(prof, monkeypatch, used={"1.0-1ubuntu1+acme2"})
+    f = merge.merge_finish(prof, pkg, "resolute", repo)
+    assert (f.version, f.kept_base) == ("1.0-1ubuntu1+acme3", True)
+    text = (repo / "debian/changelog").read_text()
+    assert "keeps the base 1.0-1ubuntu1, 1.0-1ubuntu1build1+acme1 would sort below the previous version" in " ".join(text.split())
+    # the base is read from the changelog, so status and the next merge see 1.0-1ubuntu1build1, not 1.0-1ubuntu1
+    assert versions.archive_base(text, "hello", "acme") == "1.0-1ubuntu1build1"
+
+
+def test_merge_finish_dry_run_writes_nothing(prof, tmp_path, world, monkeypatch):
+    pkg, repo = prepare(prof, tmp_path, world, {})
+    merge.merge_start(prof, pkg, "resolute", repo, V2)
+    _finish_profile(prof, monkeypatch)
+    head = gitutil.rev("HEAD", repo)
+    f = merge.merge_finish(prof, pkg, "resolute", repo, dry_run=True)
+    assert f.commit is None and f.entry.startswith("hello-acme (1.0-1ubuntu1.1+acme1)")
+    assert gitutil.rev("HEAD", repo) == head and gitutil.is_clean(repo)
+    assert "dry run   nothing written" in merge.render_finish(f)
+
+
+def test_merge_finish_refuses_before_the_merge_is_committed_and_without_an_identity(prof, tmp_path, world, monkeypatch):
+    pkg, repo = prepare(prof, tmp_path, world, {"debian/control": CONTROL_V1.replace("ubuntu-devel-discuss", "x")})
+    assert not merge.merge_start(prof, pkg, "resolute", repo, V2).merged
+    with pytest.raises(merge.Refused, match="not committed"):
+        merge.merge_finish(prof, pkg, "resolute", repo)
+    merge.abort(prof, pkg, "resolute", repo)
+    with pytest.raises(merge.Refused, match="run merge finish on acme-proposed/resolute"):
+        merge.merge_finish(prof, pkg, "resolute", repo)
+
+
+def test_merge_finish_without_an_identity_needs_me(prof, tmp_path, world, monkeypatch):
+    pkg, repo = prepare(prof, tmp_path, world, {})
+    merge.merge_start(prof, pkg, "resolute", repo, V2)
+    monkeypatch.delenv("DEBFULLNAME", raising=False)
+    monkeypatch.delenv("DEBEMAIL", raising=False)
+    with pytest.raises(merge.Refused, match="no \\[changelog\\] name and email"):
+        merge.merge_finish(prof, pkg, "resolute", repo, skip_ppa_check=True)
+    monkeypatch.setenv("DEBFULLNAME", "Me")
+    monkeypatch.setenv("DEBEMAIL", "me@example.com")
+    f = merge.merge_finish(prof, pkg, "resolute", repo, me=True, skip_ppa_check=True)
+    assert "Me <me@example.com>" in f.entry
+    assert any("no target PPA" in w for w in f.warnings)
+
+
+def test_merge_finish_stops_on_a_lint_error_the_merge_brought_and_keeps_old_ones(prof, tmp_path, world, monkeypatch):
+    # the archive adds a binary package, which our delta does not rename: a new binary-rename error
+    control = CONTROL_V1 + "\nPackage: hello-extra\nArchitecture: all\nDescription: extra\n x\n"
+    pkg, repo = prepare(prof, tmp_path, world, {"debian/control": control})
+    assert merge.merge_start(prof, pkg, "resolute", repo, V2).merged
+    _finish_profile(prof, monkeypatch)
+    head = gitutil.rev("HEAD", repo)
+    with pytest.raises(merge.LintFailed) as e:
+        merge.merge_finish(prof, pkg, "resolute", repo)
+    assert any("hello-extra" in x.message for x in e.value.findings)
+    assert gitutil.rev("HEAD", repo) == head and gitutil.is_clean(repo)
+
+
+def test_merge_finish_carries_lint_errors_that_were_there_before(prof, tmp_path, world, monkeypatch):
+    work = tmp_path / "work"
+    write(work, "debian/hello.install", "usr/bin/*\n")   # an old, already wrong debhelper file
+    commit(work, "leftover file")
+    git(work, "push", "-q", "origin", "acme/resolute")
+    pkg, repo = prepare(prof, tmp_path, world, {})
+    assert merge.merge_start(prof, pkg, "resolute", repo, V2).merged
+    _finish_profile(prof, monkeypatch)
+    f = merge.merge_finish(prof, pkg, "resolute", repo)
+    assert f.commit and any("hello.install" in c for c in f.carried)

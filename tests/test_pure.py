@@ -155,3 +155,68 @@ def test_list_merge_lets_both_sides_drop_the_same_blank_line():
 def test_patch_targets_include_the_path_without_its_leading_directory():
     text = "--- a/configure.ac\n+++ b/configure.ac\n@@\n+x\n--- /dev/null\n+++ b/m4/new.m4\n+++ /dev/null\n"
     assert merge.patch_targets(text) == {"b/configure.ac", "configure.ac", "b/m4/new.m4", "m4/new.m4"}
+
+
+def test_choose_version_follows_the_rule_when_it_sorts_above():
+    assert versions.choose_version("1.28.3-2ubuntu1.12", "1.28.3-2ubuntu1.4+acme7", "acme") == ("1.28.3-2ubuntu1.12+acme1", False)
+    assert versions.choose_version("3.5.5-1ubuntu3.7", "3.5.5-1ubuntu3+acme5", "acme") == ("3.5.5-1ubuntu3.7+acme1", False)
+
+
+def test_choose_version_keeps_the_base_when_the_archive_appended_letters():
+    # dpkg sorts letters before '+', so 5:8.0.5-1ubuntu0.1+acme1 < 5:8.0.5-1+acme5
+    assert versions.choose_version("5:8.0.5-1ubuntu0.1", "5:8.0.5-1+acme5", "acme") == ("5:8.0.5-1+acme6", True)
+    assert versions.choose_version("2.10-5build1", "2.10-5+gpptest1", "gpptest") == ("2.10-5+gpptest2", True)
+
+
+def test_choose_version_skips_versions_the_ppa_has_used():
+    used = {"1.28.3-2ubuntu1.12+acme1", "1.28.3-2ubuntu1.12+acme2"}
+    assert versions.choose_version("1.28.3-2ubuntu1.12", "1.28.3-2ubuntu1.4+acme7", "acme", used=used)[0] == "1.28.3-2ubuntu1.12+acme3"
+    assert versions.choose_version("2.10-5build1", "2.10-5+gpptest1", "gpptest", used={"2.10-5+gpptest2"})[0] == "2.10-5+gpptest3"
+
+
+def test_choose_version_continues_the_counter_on_the_same_base():
+    # a second upload on the same archive version is a counter bump, not a kept older base
+    assert versions.choose_version("2.10-5build1", "2.10-5build1+gpptest1", "gpptest") == ("2.10-5build1+gpptest2", False)
+
+
+def test_choose_version_for_a_package_not_in_the_archive():
+    assert versions.choose_version("26.01-0ubuntu2", "26.01-0ubuntu1~acme3", "acme", in_archive=False) == ("26.01-0ubuntu2~acme1", False)
+
+
+ARCHIVE_CL = """hello-acme (1.0-1+acme5) resolute; urgency=medium
+
+  * delta
+
+ -- A <a@b.c>  Tue, 02 Jan 2026 00:00:00 +0000
+
+hello (1.0-1ubuntu0.1) resolute-security; urgency=medium
+
+  * SECURITY UPDATE: CVE-2026-1
+
+ -- U <u@b.c>  Mon, 01 Jan 2026 00:00:00 +0000
+
+hello (1.0-1) unstable; urgency=medium
+
+  * Initial.
+
+ -- D <d@b.c>  Sun, 31 Dec 2025 00:00:00 +0000
+"""
+
+
+def test_archive_base_reads_the_newest_archive_entry_not_the_top_version():
+    assert versions.archive_base(ARCHIVE_CL, "hello", "acme") == "1.0-1ubuntu0.1"
+    assert versions.strip_suffix(versions.top_version(ARCHIVE_CL), "acme") == "1.0-1"
+    assert versions.archive_base(ARCHIVE_CL, "other", "acme") is None
+
+
+def test_changelog_entry_is_a_valid_wrapped_debian_entry():
+    from datetime import datetime, timezone
+    from debian.changelog import Changelog
+    long = "It includes the fixes for " + ", ".join(f"CVE-2026-{n:05d}" for n in range(1, 12)) + "."
+    e = merge.changelog_entry("hello-acme", "1.0-2+acme1", "resolute", ["Merge 1.0-2.", long], "Bot", "bot@example.com",
+                              datetime(2026, 11, 4, 9, 0, tzinfo=timezone.utc))
+    assert all(len(l) <= 80 for l in e.splitlines())
+    b = next(iter(Changelog(e + ARCHIVE_CL)))
+    assert (b.package, str(b.version), b.distributions, b.urgency) == ("hello-acme", "1.0-2+acme1", "resolute", "medium")
+    assert b.author == "Bot <bot@example.com>" and b.date == "Wed, 04 Nov 2026 09:00:00 +0000"
+    assert "CVE-2026-00011" in "\n".join(b.changes())

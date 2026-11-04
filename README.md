@@ -46,6 +46,7 @@ intercepted by git.
 | `clone <package> [dir]` | Clone the downstream repository, add the Ubuntu import as a remote, register `dpkg-mergechangelogs` as the merge driver for `debian/changelog` |
 | `sync [package]` | Fast-forward the local mirror branch to the import tag of the newest followed version |
 | `merge start [package]` | Merge the archive import tag into the downstream branch on a staging branch, report the tier (mechanical, ai-assisted, re-port) and the risk, leave conflicts in the tree |
+| `merge finish [package]` | After the merge is committed: choose the new version, add a changelog entry, check that the merge brought no new lint error, commit. `--dry-run` shows the version and the entry, `--me` signs as you instead of the profile identity, `--skip-ppa-check` for a PPA the tool cannot read |
 | `lint [package]` | Check the packaging rules the profile enables |
 | `orig [package]` | Fetch the orig tarball of the base version from Launchpad, verify its checksum, and name it for the downstream source |
 | `login [package...]` | Store a Launchpad access token for private repositories, one at a prompt, or many from a JSON file or standard input with `--from-file` |
@@ -83,6 +84,22 @@ an addition. It is not resolved when both sides drop or replace the same patch, 
 patch in different places, or when the result would list a patch twice, those stay conflicts. The report
 has a `resolved` line with the counts, and the patches still have to apply, which the build checks.
 
+### How `merge finish` chooses the version
+
+The new version must sort above the previous downstream version, and must never have been used in the
+target PPA (Launchpad keeps a version number taken even after a deletion, so `merge finish` reads every
+version the PPA ever had). The rule is `<archive version>+<tag>1`, or `~<tag>1` for a package that is not
+in the archive, with the counter going up past used numbers.
+
+That does not work when the archive appended letters to the old version, for example `5:8.0.5-1` to
+`5:8.0.5-1ubuntu0.1` or `2.10-5` to `2.10-5build1`: dpkg sorts letters before `+`, so
+`5:8.0.5-1ubuntu0.1+acme1` is lower than `5:8.0.5-1+acme5`. Then the old base is kept and only the counter
+goes up (`5:8.0.5-1+acme6`), and the entry says so. The archive version a downstream is based on is
+therefore read from its changelog (the newest entry of the archive source), never from its version.
+
+`merge finish` refuses to commit when the changelog entry or the merge leaves a lint error that the
+downstream did not have before the merge. Errors that were already there are listed as carried.
+
 ## Profile
 
 A TOML file. A minimal one:
@@ -112,9 +129,17 @@ files = ["configure.ac", "*.m4"]
 [rules]
 enable = ["version-order", "binary-rename", "no-stale-names", "no-empty-packages"]
 
+[ppa]
+owner = "acme-team"                # the package's ppa below is ~acme-team/ubuntu/<ppa>
+
+[changelog]                        # who signs the entries of merge finish, a bot account
+name = "Acme Bot"
+email = "bot@example.com"
+
 [[package]]
 name = "hello-acme"
 archive = "hello"
+ppa = "acme-proposed"              # or a full reference, ~owner/ubuntu/name
 ```
 
 Templates may use `{tag}`, `{series}`, `{name}`, `{archive}` and, for ssh URLs, `{lpuser}`.
@@ -174,7 +199,7 @@ The snap can only read files under the home directory, so use a workspace there.
   cache are removed once they are older than that.
 - `status` skips the base version of packages marked `large` in the profile, add `--include-large`
   to read them, the first fetch is slow.
-- `merge start` leaves a conflicted tree for you to resolve. `merge finish`, building and uploading
+- `merge start` leaves a conflicted tree for you to resolve. Building and uploading
   are not implemented.
 
 ## Development

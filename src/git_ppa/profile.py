@@ -55,6 +55,9 @@ class Profile:
     rules_enabled: list[str]
     identity_allowed: list[str]
     packages: dict[str, Package]
+    ppa_owner: str = ""
+    changelog_name: str = ""
+    changelog_email: str = ""
 
     def package(self, name: str) -> Package:
         if name in self.packages:
@@ -83,6 +86,14 @@ class Profile:
 
     def upstream_repo_url(self, pkg: Package) -> str:
         return self.expand(self.upstream_url, name=pkg.name, archive=pkg.archive)
+
+    def ppa_reference(self, pkg: Package) -> str | None:
+        """~owner/ubuntu/name of the PPA the package goes to, or None when the profile does not say."""
+        if not pkg.ppa:
+            return None
+        if pkg.ppa.startswith("~"):
+            return pkg.ppa
+        return f"~{self.ppa_owner}/ubuntu/{pkg.ppa}" if self.ppa_owner else None
 
     def binary_suffix(self) -> str:
         return self.expand(self.rename_suffix)
@@ -136,6 +147,9 @@ def from_dict(d: dict) -> Profile:
         rules_enabled=list(rules.get("enable", [])),
         identity_allowed=list(rules.get("changelog_identity_allowed", [])),
         packages=packages,
+        ppa_owner=d.get("ppa", {}).get("owner", ""),
+        changelog_name=d.get("changelog", {}).get("name", ""),
+        changelog_email=d.get("changelog", {}).get("email", ""),
     )
 
 

@@ -177,6 +177,20 @@ def run(*args: str, cwd: str | Path | None = None, check: bool = True, timeout: 
     return p
 
 
+def run_bytes(*args: str, cwd: str | Path | None = None, timeout: int = TIMEOUT) -> bytes:
+    """Binary output, for git archive."""
+    env = _env()
+    try:
+        p = subprocess.run([_git_command(env), *args], cwd=cwd, env=env, capture_output=True, timeout=timeout)
+    except FileNotFoundError:
+        raise ToolMissing(f"git not found, {HINTS['git']}") from None
+    except subprocess.TimeoutExpired:
+        raise GitError(args, -1, f"git timed out after {timeout} s") from None
+    if p.returncode != 0:
+        raise GitError(args, p.returncode, p.stderr.decode(errors="replace"))
+    return p.stdout
+
+
 def out(*args: str, cwd: str | Path | None = None, check: bool = True) -> str:
     return run(*args, cwd=cwd, check=check).stdout.strip()
 
