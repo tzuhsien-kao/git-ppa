@@ -90,5 +90,68 @@ def test_classify_caps():
     assert merge.classify([], "low", caps) == "mechanical"
     assert merge.classify(one, "low", caps) == "ai-assisted"
     assert merge.classify([merge.Conflict("debian/rules", [(8, 4)])], "low", caps) == "ai-assisted"
-    assert merge.classify([merge.Conflict("debian/rules", [(8, 4)])], "high", caps) == "re-port"
+    assert merge.classify([merge.Conflict("debian/rules", [(8, 4)])], "high", caps) == "ai-assisted"
+    assert merge.classify([merge.Conflict("debian/rules", [(12, 4)])], "high", caps) == "re-port"
+    assert merge.classify([merge.Conflict("debian/rules", [(1, 1)] * 2)], "high", caps) == "re-port"
     assert merge.classify(one * 3, "low", caps) == "re-port"
+    assert (caps.low, caps.high) == ((2, 3, 10), (1, 1, 10))
+
+
+A, B, C, D = "a.patch", "b.patch", "c.patch", "d.patch"
+
+
+def test_list_merge_takes_the_additions_of_both_sides():
+    out, stats = merge.merge_lists([A, B], [A, B, "ours.patch"], [A, B, "theirs.patch"])
+    assert out == [A, B, "ours.patch", "theirs.patch"]
+    assert stats == {"ours_added": 1, "ours_dropped": 0, "theirs_added": 1, "theirs_dropped": 0}
+
+
+def test_list_merge_follows_a_drop_on_one_side_and_additions_on_both():
+    # the openssl case: the archive dropped a patch and added many, we added a few at the end
+    out, _ = merge.merge_lists([A, B], [A, B, "ours.patch"], [B, "cve-1.patch", "cve-2.patch"])
+    assert out == [B, "ours.patch", "cve-1.patch", "cve-2.patch"]
+
+
+def test_list_merge_keeps_additions_where_they_were_made():
+    out, _ = merge.merge_lists([A, B, C], [A, "ours.patch", B, C], [A, B, "theirs.patch", C])
+    assert out == [A, "ours.patch", B, "theirs.patch", C]
+
+
+def test_list_merge_re_enabling_a_commented_out_patch():
+    out, _ = merge.merge_lists(["#x.patch", B], ["#x.patch", B, "ours.patch"], ["x.patch", B])
+    assert out == ["x.patch", B, "ours.patch"]
+
+
+def test_list_merge_dedupes_the_same_line_added_in_the_same_place():
+    out, _ = merge.merge_lists([A], [A, "same.patch"], [A, "same.patch", "more.patch"])
+    assert out == [A, "same.patch", "more.patch"]
+
+
+def test_list_merge_with_blank_and_comment_lines_like_a_real_series_file():
+    base = ["a.patch", "", "# Ubuntu patches", "", "u.patch", "gone.patch", "", "# FIPS", "fips/f.patch", "CVE-1.patch"]
+    ours = base + ["acme.patch"]
+    theirs = ["a.patch", "", "# Ubuntu patches", "", "u.patch", "", "# FIPS", "fips/f.patch", "CVE-1.patch", "CVE-2.patch", "CVE-3.patch"]
+    out, stats = merge.merge_lists(base, ours, theirs)
+    assert out == ["a.patch", "", "# Ubuntu patches", "", "u.patch", "", "# FIPS", "fips/f.patch", "CVE-1.patch",
+                   "acme.patch", "CVE-2.patch", "CVE-3.patch"]
+    assert stats["ours_added"] == 1 and stats["theirs_added"] == 2 and stats["theirs_dropped"] == 1
+
+
+def test_list_merge_treats_a_moved_line_as_a_drop_and_an_addition():
+    assert merge.merge_lists([A, B], [B, A], [A, B, C])[0] == [B, A, C]
+
+
+def test_list_merge_refuses_what_it_cannot_judge():
+    assert merge.merge_lists([A, B], ["a2.patch", B], ["a3.patch", B]) is None   # both replace the same line
+    assert merge.merge_lists([A, B], [B], [B, C]) is None                         # both drop the same line
+    assert merge.merge_lists([A, B], [A, B, C], [C, A, B]) is None                # same line added in two places
+    assert merge.merge_lists([A, B], [A, B, B], [A, B, C]) is None                # the result would name a patch twice
+
+
+def test_list_merge_lets_both_sides_drop_the_same_blank_line():
+    assert merge.merge_lists([A, "", B], [A, B], [A, B, C])[0] == [A, B, C]
+
+
+def test_patch_targets_include_the_path_without_its_leading_directory():
+    text = "--- a/configure.ac\n+++ b/configure.ac\n@@\n+x\n--- /dev/null\n+++ b/m4/new.m4\n+++ /dev/null\n"
+    assert merge.patch_targets(text) == {"b/configure.ac", "configure.ac", "b/m4/new.m4", "m4/new.m4"}

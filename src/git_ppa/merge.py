@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import difflib
 import fnmatch
 import re
 from dataclasses import asdict, dataclass, field
@@ -57,6 +58,10 @@ class Report:
     risk: str
     tier: str
     warnings: list[str]
+    # conflicts the tool resolved itself, so a reader can see what was not decided by git
+    resolved: list[str] = field(default_factory=list)
+    # build system files the merge changed that our delta does not touch, listed but not counted as risk
+    build_system_other: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -184,6 +189,107 @@ def classify(conflicts: list[Conflict], risk_level: str, caps: Caps) -> str:
     return "ai-assisted" if within else "re-port"
 
 
+SERIES = "debian/patches/series"
+
+
+def _edits(base: list[str], side: list[str]) -> tuple[set[int], dict[int, list[str]]]:
+    """What one side did to the base list: the base lines it dropped, and the lines it put before base line N.
+
+    Lines are aligned as a sequence, so repeated lines such as the blank separators of a series file are
+    fine, and a line that was moved shows up as a drop plus an addition.
+    """
+    dropped: set[int] = set()
+    added: dict[int, list[str]] = {}
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, base, side, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        dropped.update(range(i1, i2))
+        if j2 > j1:
+            added.setdefault(i1, []).extend(side[j1:j2])
+    return dropped, added
+
+
+def merge_lists(base: list[str], ours: list[str], theirs: list[str]) -> tuple[list[str], dict[str, int]] | None:
+    """Three way merge of an ordered list of lines such as debian/patches/series.
+
+    Git calls it a conflict when one side adds lines next to a line the other side drops, although both
+    changes are plain. Here each side may add and drop lines, additions at the same place keep ours first.
+    Refused (None) when both sides drop the same line (a replacement on both sides cannot be told from two
+    different ones, blank lines excepted), when both sides add the same line in different places, or when
+    the result would name a line twice that the base named once.
+    """
+    drop_o, add_o = _edits(base, ours)
+    drop_t, add_t = _edits(base, theirs)
+    if any(base[i].strip() for i in drop_o & drop_t):
+        return None
+    where = {line: i for i, lines in add_o.items() for line in lines if line.strip()}
+    if any(line in where and where[line] != i for i, lines in add_t.items() for line in lines if line.strip()):
+        return None
+    out: list[str] = []
+    for i in range(len(base) + 1):
+        mine = add_o.get(i, [])
+        out += mine + [x for x in add_t.get(i, []) if not (x.strip() and x in mine)]
+        if i < len(base) and i not in drop_o | drop_t:
+            out.append(base[i])
+    twice = {x for x in out if x.strip() and out.count(x) > 1}
+    if twice - {x for x in base if x.strip() and base.count(x) > 1}:
+        return None
+    stats = {
+        "ours_added": sum(len(v) for v in add_o.values()), "ours_dropped": len(drop_o),
+        "theirs_added": sum(len(v) for v in add_t.values()), "theirs_dropped": len(drop_t),
+    }
+    return out, stats
+
+
+def _resolve_series(repo: Path) -> str | None:
+    """Resolve a conflict in debian/patches/series by a list merge, when it is safe. Returns what was done."""
+    stages = []
+    for n in (1, 2, 3):
+        p = gitutil.run("show", f":{n}:{SERIES}", cwd=repo, check=False)
+        if p.returncode != 0:
+            return None
+        stages.append(p.stdout.splitlines())
+    merged = merge_lists(*stages)
+    if merged is None:
+        return None
+    lines, s = merged
+    (repo / SERIES).write_text("\n".join(lines) + ("\n" if lines else ""))
+    gitutil.run("add", SERIES, cwd=repo)
+    return (f"{SERIES}: merged as a list, ours +{s['ours_added']} -{s['ours_dropped']}, "
+            f"theirs +{s['theirs_added']} -{s['theirs_dropped']}, the patches still have to apply")
+
+
+PATCH_TARGET = re.compile(r"^\+\+\+ (\S+)", re.M)
+
+
+def patch_targets(text: str) -> set[str]:
+    """Files a patch modifies. The leading directory is dropped as well, patches use -p0 or -p1."""
+    out: set[str] = set()
+    for m in PATCH_TARGET.finditer(text):
+        path = m[1]
+        if path == "/dev/null":
+            continue
+        out.add(path)
+        if "/" in path:
+            out.add(path.split("/", 1)[1])
+    return out
+
+
+def delta_files(repo: Path, old_ref: str) -> set[str] | None:
+    """Files our delta touches: the ones it changes in the tree, and the ones its patches modify.
+
+    None when the previous archive version is not known, nothing can be said about the delta then.
+    """
+    if not gitutil.rev("old/ubuntu", repo):
+        return None
+    names = gitutil.out("diff", "--name-only", "old/ubuntu", old_ref, cwd=repo).splitlines()
+    files = set(names)
+    for n in names:
+        if n.startswith("debian/patches/") and n != SERIES:
+            files |= patch_targets(gitutil.show(old_ref, n, repo))
+    return files
+
+
 def _top_version(text: str) -> str | None:
     m = re.match(r"\S+ \(([^)]+)\)", text)
     return m.group(1) if m else None
@@ -237,9 +343,19 @@ def merge_start(profile: Profile, pkg: Package, series: str, repo: Path, target:
     merged = p.returncode == 0
     old_ref = f"old/{profile.tag}"
 
+    resolved: list[str] = []
+    unmerged = gitutil.out("diff", "--name-only", "--diff-filter=U", cwd=repo).splitlines()
+    if SERIES in unmerged:
+        done = _resolve_series(repo)
+        if done:
+            resolved.append(done)
     conflicts: list[Conflict] = []
     conflict_text: dict[str, str] = {}
-    for path in gitutil.out("diff", "--name-only", "--diff-filter=U", cwd=repo).splitlines():
+    left = gitutil.out("diff", "--name-only", "--diff-filter=U", cwd=repo).splitlines()
+    if resolved and not left and not merged:
+        gitutil.run("commit", "--no-edit", "-q", cwd=repo)
+        merged = True
+    for path in left:
         text = (repo / path).read_text(errors="replace") if (repo / path).exists() else ""
         conflict_text[path] = text
         conflicts.append(Conflict(path, parse_conflicts(text)))
@@ -249,6 +365,10 @@ def merge_start(profile: Profile, pkg: Package, series: str, repo: Path, target:
         status, _, path = line.partition("\t")
         changed.append((status, path.split("\t")[-1]))
 
+    delta = delta_files(repo, old_ref)
+    if delta is None:
+        warnings.append("old/ubuntu is not set, every build system file the merge changed counts as risk")
+    build_other: list[str] = []
     hits: list[Hit] = []
     for status, path in changed:
         if path in ("debian/rules", "debian/control"):
@@ -261,7 +381,10 @@ def merge_start(profile: Profile, pkg: Package, series: str, repo: Path, target:
                 added += conflict_lines(conflict_text[path])
             hits += risk_hits(path, gitutil.show(old_ref, path, repo), new_text, removed, added, profile.risk)
         if any(fnmatch.fnmatch(Path(path).name, g) for g in profile.risk.files):
-            hits.append(Hit("build-system", path, 0, status))
+            if delta is None or path in delta:
+                hits.append(Hit("build-system", path, 0, status))
+            else:
+                build_other.append(path)
 
     hits = list(dict.fromkeys((h.kind, h.path, h.line, h.text) for h in hits))
     hits = [Hit(*h) for h in hits]
@@ -275,6 +398,7 @@ def merge_start(profile: Profile, pkg: Package, series: str, repo: Path, target:
         merged=merged, merge_commit=(gitutil.rev("HEAD", repo) or "")[:12] if merged else None,
         conflicts=conflicts, changed=changed, series_changes=series_changes, hits=hits, risk=risk,
         tier=classify(conflicts, risk, profile.caps), warnings=warnings,
+        resolved=resolved, build_system_other=build_other,
     )
 
 
@@ -326,6 +450,13 @@ def render(r: Report, limit: int = 8) -> str:
             lines.append(f"          [{h.kind}] {h.path}:{h.line} {h.text[:80]}".rstrip())
         if len(r.hits) > limit:
             lines.append(f"          ... {len(r.hits) - limit} more, use --json for all")
+    for x in r.resolved:
+        lines.append(f"resolved  {x}")
+    if r.build_system_other:
+        lines.append(
+            f"note      {len(r.build_system_other)} build system file(s) changed that our delta does not touch, "
+            "not counted as risk: " + ", ".join(r.build_system_other[:limit]) + (" ..." if len(r.build_system_other) > limit else "")
+        )
     for w in r.warnings:
         lines.append(f"warning   {w}")
     return "\n".join(lines)

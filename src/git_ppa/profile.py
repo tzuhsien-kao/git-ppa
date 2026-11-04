@@ -31,7 +31,7 @@ class Risk:
 @dataclass
 class Caps:
     low: tuple[int, int, int] = (2, 3, 10)
-    high: tuple[int, int, int] = (1, 1, 3)
+    high: tuple[int, int, int] = (1, 1, 10)
 
 
 @dataclass

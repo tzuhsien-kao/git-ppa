@@ -57,6 +57,32 @@ Global options: `--profile FILE` (or `GIT_PPA_PROFILE`), `--series`, `--lpuser` 
 Exit codes: 0 ok, 1 error or lint failure, 2 `status --check` found a package behind, 3 `merge start`
 stopped with conflicts, 4 refused by a safety check.
 
+### How `merge start` judges a merge
+
+Two separate answers, both in the report.
+
+**Risk, high or low.** The merge is compared with the downstream tip from before it, line by line. It is
+high risk if any changed line is in one of the sensitive regions of the profile, otherwise low:
+
+- `debian/rules`: lines matching a `[risk] rules_markers` pattern, or inside an `ifeq` block that has one.
+- `debian/control`: lines in a field listed in `control_fields` (the package renaming relations).
+- Build system files named in `[risk] files` (for example `configure.ac`, `meson.build`), only when **our
+  delta touches the same file**, directly or through one of its patches. The delta is everything that
+  differs between the previous archive version (the `old/ubuntu` tag) and the downstream tip. Other changes
+  to such files, for example an upstream version bump, are listed in the report as a note and not counted.
+  Without `old/ubuntu` every such file counts and the report says so.
+
+**Tier.** No conflict is `mechanical`. With conflicts, the `[caps]` of the profile decide: files, regions
+and lines per side, `low` for a low risk merge and `high` for a high risk one, within them it is
+`ai-assisted`, beyond them `re-port`. A high risk merge needs a human review in any case, so its cap only
+limits what an automatic attempt may try first.
+
+**A conflict in `debian/patches/series` is resolved by the tool** when it is a plain list merge: each side
+may add and drop lines, repeated blank and comment lines are fine, and a moved line counts as a drop plus
+an addition. It is not resolved when both sides drop or replace the same patch, when both add the same
+patch in different places, or when the result would list a patch twice, those stay conflicts. The report
+has a `resolved` line with the counts, and the patches still have to apply, which the build checks.
+
 ## Profile
 
 A TOML file. A minimal one:

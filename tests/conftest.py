@@ -131,6 +131,9 @@ def world(tmp_path, prof):
     write(up, "debian/control", CONTROL_V1)
     write(up, "debian/rules", RULES_V1)
     write(up, "configure.ac", "AC_INIT([hello],[1.0])\n")
+    write(up, "debian/patches/series", "a.patch\nb.patch\n")
+    write(up, "debian/patches/a.patch", "a\n")
+    write(up, "debian/patches/b.patch", "b\n")
     commit(up, "1.0-1ubuntu1 (patches unapplied)")
     git(up, "tag", "import/1.0-1ubuntu1")
 
