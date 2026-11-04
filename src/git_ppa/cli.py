@@ -12,7 +12,7 @@ import re
 import sys
 from pathlib import Path
 
-from . import __version__, credentials, gitutil, lint, lp, merge, orig, profile as profile_mod, status, versions, workspace
+from . import __version__, build as build_mod, credentials, gitutil, lint, lp, merge, orig, profile as profile_mod, signing, status, upload as upload_mod, versions, workspace
 
 
 class CliError(Exception):
@@ -263,6 +263,59 @@ def cmd_orig(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_build(args: argparse.Namespace) -> int:
+    prof = _profile(args)
+    repo = _repo(args)
+    pkg = _pkg(prof, args, repo)
+    series = args.series or prof.series[0]
+    if not args.sign_key_file:
+        built = build_mod.build(prof, pkg, series, repo)
+    else:
+        secret = signing.read_secret(args.sign_key_file)
+        with signing.Keyring(secret, os.environ.get("GIT_PPA_GPG_PASSPHRASE")) as key:
+            built = build_mod.build(prof, pkg, series, repo, key)
+    _emit(args, built.to_dict(), build_mod.render(built))
+    return 0
+
+
+def cmd_upload(args: argparse.Namespace) -> int:
+    prof = _profile(args)
+    repo = _repo(args)
+    pkg = _pkg(prof, args, repo)
+    ppa = args.ppa or prof.ppa_reference(pkg)
+    if not ppa:
+        raise CliError("no target PPA, the package has none in the profile, use --ppa ~owner/ubuntu/name")
+    if ppa not in prof.allow_ppas:
+        raise merge.Refused(f"{ppa} is not in [safety] allow_ppas of the profile, the profile has to name every PPA it may write to")
+    text = (repo / "debian/changelog").read_text(encoding="utf-8")
+    version = versions.newest_of(text, pkg.name) or ""
+    changes = Path(args.changes) if args.changes else repo.parent / build_mod.changes_name(pkg.name, version)
+    if not changes.is_file():
+        raise CliError(f"{changes} does not exist, run build with --sign-key-file first")
+    user = _lpuser(args)
+    key = None
+    if not args.dry_run:
+        if not args.ssh_key_file:
+            raise CliError("--ssh-key-file FILE (mode 600) or - for standard input is needed, there is no ssh agent in the snap")
+        key = upload_mod.load_private_key(signing.read_secret(args.ssh_key_file), os.environ.get("GIT_PPA_SSH_PASSPHRASE"))
+    res = upload_mod.upload(
+        changes, ppa, user, key, host=args.host, port=args.port, incoming=args.incoming,
+        fingerprints=set(args.host_fingerprint) or None, dry_run=args.dry_run,
+    )
+    data = res.to_dict()
+    lines = [f"{'would upload' if res.dry_run else 'uploaded'} {res.source} {res.version} to {res.ppa} on {res.host}"]
+    lines += [f"  {n}" for n in res.files]
+    if args.wait and not res.dry_run:
+        state = upload_mod.wait(ppa, res.source, res.version, args.wait, log=lambda m: print(m, file=sys.stderr))
+        data["publication"] = state
+        if state is None:
+            lines.append(f"not published after {args.wait} s, Launchpad mails the uploader if it rejects an upload")
+        else:
+            lines.append(f"{state['status']}: " + (", ".join(f"{b['arch']} {b['state']}" for b in state["builds"]) or "no build yet"))
+    _emit(args, data, "\n".join(lines))
+    return 0
+
+
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str):
         # argparse exits 2 by default, which would collide with `status --check` meaning "behind"
@@ -334,6 +387,24 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--all", action="store_true", help="every package of the profile")
     s.set_defaults(func=cmd_logout)
 
+    s = add("build", "build the source package, signed when a key is given")
+    s.add_argument("package", nargs="?")
+    s.add_argument("--sign-key-file", metavar="FILE", help="exported secret key, a file (mode 600) or - for standard input, the passphrase is read from GIT_PPA_GPG_PASSPHRASE")
+    s.set_defaults(func=cmd_build)
+
+    s = add("upload", "upload a signed source package to a PPA over sftp")
+    s.add_argument("package", nargs="?")
+    s.add_argument("--changes", help="default is the .changes of the newest version, next to the repository")
+    s.add_argument("--ppa", help="~owner/ubuntu/name, default is the PPA of the package in the profile")
+    s.add_argument("--ssh-key-file", metavar="FILE", help="private key registered on the Launchpad account, a file (mode 600) or - for standard input, the passphrase is read from GIT_PPA_SSH_PASSPHRASE")
+    s.add_argument("--wait", type=int, default=0, metavar="SECONDS", help="then wait this long for the publication and the builds")
+    s.add_argument("--dry-run", action="store_true", help="check the files and the target, connect to nothing")
+    s.add_argument("--host", default=upload_mod.HOST, help="for tests only")
+    s.add_argument("--port", type=int, default=22, help="for tests only")
+    s.add_argument("--incoming", help="for tests only, the directory on the server")
+    s.add_argument("--host-fingerprint", action="append", default=[], metavar="SHA256:...", help="for tests only")
+    s.set_defaults(func=cmd_upload)
+
     s = add("lint", "check packaging rules")
     s.add_argument("package", nargs="?")
     s.add_argument("--rule", action="append")
@@ -354,6 +425,6 @@ def main(argv: list[str] | None = None) -> int:
     except merge.Refused as e:
         print(f"refused: {e}", file=sys.stderr)
         return 4
-    except (CliError, profile_mod.ProfileError, workspace.WorkspaceError, orig.OrigError, lp.LaunchpadError, gitutil.GitError, gitutil.ToolMissing) as e:
+    except (CliError, profile_mod.ProfileError, workspace.WorkspaceError, orig.OrigError, lp.LaunchpadError, gitutil.GitError, gitutil.ToolMissing, build_mod.BuildError, signing.SigningError, upload_mod.UploadError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

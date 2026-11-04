@@ -100,6 +100,31 @@ therefore read from its changelog (the newest entry of the archive source), neve
 `merge finish` refuses to commit when the changelog entry or the merge leaves a lint error that the
 downstream did not have before the merge. Errors that were already there are listed as carried.
 
+### Building, signing and uploading
+
+```
+git ppa build --sign-key-file KEY                      # signed source package next to the checkout
+git ppa upload --lpuser <you> --ssh-key-file SSHKEY    # to the PPA named in the profile
+```
+
+The tool uses none of the keys of the machine it runs on. A strict snap cannot reach your keyring, agent
+or `~/.ssh` anyway, so both keys are given to it:
+
+- `--sign-key-file` is a secret key exported with `gpg --export-secret-keys <id>`, a file (mode 600) or
+  `-` for standard input. It is imported into a temporary keyring that is deleted afterwards, the passphrase
+  is read from `GIT_PPA_GPG_PASSPHRASE` and checked right away. Pass only the signing key.
+- `--ssh-key-file` is the private key registered on your Launchpad account (OpenSSH or PEM format, the
+  passphrase in `GIT_PPA_SSH_PASSPHRASE`), a file or `-`. There is no ssh executable and no agent, the upload
+  is a small sftp client, and the host key of `ppa.launchpad.net` is pinned to the fingerprint that Launchpad
+  publishes.
+
+`build` stops when the top changelog entry is not one of the downstream source (run `merge finish` first),
+when the tree is not clean, or when the version does not sort above the previous one. When dpkg fails the
+tree is restored. `upload` refuses a `.changes` that is not signed or whose files do not match their
+checksums, and **refuses a PPA that the profile does not name** under `[safety] allow_ppas`, so a profile
+cannot write to a PPA by mistake. The files go in one by one and the `.changes` last. Launchpad uses a
+version number once per PPA, even after a deletion, and mails the uploader when it rejects an upload.
+
 ## Profile
 
 A TOML file. A minimal one:
@@ -135,6 +160,9 @@ owner = "acme-team"                # the package's ppa below is ~acme-team/ubunt
 [changelog]                        # who signs the entries of merge finish, a bot account
 name = "Acme Bot"
 email = "bot@example.com"
+
+[safety]                           # every PPA upload may write to, nothing else is accepted
+allow_ppas = ["~acme-team/ubuntu/acme-proposed"]
 
 [[package]]
 name = "hello-acme"
@@ -199,8 +227,10 @@ The snap can only read files under the home directory, so use a workspace there.
   cache are removed once they are older than that.
 - `status` skips the base version of packages marked `large` in the profile, add `--include-large`
   to read them, the first fetch is slow.
-- `merge start` leaves a conflicted tree for you to resolve. Building and uploading
-  are not implemented.
+- `merge start` leaves a conflicted tree for you to resolve.
+- A private PPA cannot be read by the tool yet, `merge finish` then needs `--skip-ppa-check` and does not
+  know which versions the PPA has used.
+- `upload --wait` reads a public PPA anonymously.
 
 ## Development
 

@@ -18,7 +18,8 @@ description: |
 
   The snap is strict and reaches the private downstream repositories over https. Create a
   Launchpad access token with the repository:pull scope for the project and store it with
-  "git ppa login".
+  "git ppa login". It builds and signs source packages and uploads them to a PPA over sftp with
+  the tools it carries, a key is passed to it as a file or on standard input, never from the host.
 
 grade: devel
 confinement: strict
@@ -30,11 +31,17 @@ apps:
   git-ppa:
     # -I ignores PYTHON* variables and the user site of the host, the snap must run on its own code
     command: bin/python3 -I -m git_ppa
+    environment:
+      # the perl of the base is not there, dpkg-source and dpkg-buildpackage are perl scripts
+      PERL5LIB: $SNAP/usr/share/perl5:$SNAP/usr/share/perl/5.40:$SNAP/usr/lib/x86_64-linux-gnu/perl5/5.40:$SNAP/usr/lib/x86_64-linux-gnu/perl-base:$SNAP/usr/lib/x86_64-linux-gnu/perl/5.40
+      DPKG_ADMINDIR: $SNAP/var/lib/dpkg
     plugs:
-      # api.launchpad.net and git.launchpad.net
+      # api.launchpad.net, git.launchpad.net and ppa.launchpad.net
       - network
       # the repositories you work in, hidden directories excluded
       - home
+      # gpg-agent listens on a unix socket, the seccomp filter denies listen() without this
+      - network-bind
 
 parts:
   git-ppa:
@@ -88,19 +95,83 @@ parts:
       - -usr/share/perl/*/Module
       - -usr/share/perl/*/Pod
 
-  changelog-merge:
-    # dpkg-mergechangelogs is in dpkg-dev, which pulls in a toolchain that is left out here
+  tools:
+    # dpkg-source, dpkg-buildpackage and dpkg-mergechangelogs (dpkg-dev), gpg for the signature. Strict
+    # confinement needs a few changes to them, found by building and signing a source package in a snap
     plugin: nil
     stage-packages:
+      # core26 has no dpkg, craft-parts skips what the base is thought to have unless it is listed
+      - dpkg
       - dpkg-dev
       - libdpkg-perl
-    override-build: |
+      - patch
+      # GNU tar extracts with openat2, which the snap seccomp filter denies (EPERM), bsdtar extracts
+      - tar
+      - libarchive-tools
+      - xz-utils
+      - bzip2
+      - zstd
+      # dpkg-source runs gunzip on a .gz orig and gpgv on an upstream signature (.asc), the base's are denied
+      - gzip
+      - gpgv
+      - gnupg
+    prime:
+      - -usr/share/doc
+      - -usr/share/man
+      - -usr/share/lintian
+      - -usr/share/bash-completion
+      - -usr/share/perl/*/pod
+      - -usr/share/perl/*/unicore/To
+      - -usr/share/perl/*/CPAN*
+      - -usr/share/perl/*/ExtUtils
+      - -usr/share/perl/*/Module
+      - -usr/share/perl/*/Pod
+      - -usr/bin/cpan*
+      - -usr/bin/pod*
+    override-prime: |
       craftctl default
-      # Dpkg::Vendor wants /etc/dpkg/origins/default, a strict snap cannot read the base's
-      mkdir -p "${CRAFT_PART_INSTALL}/usr/share/dpkg-origins"
-      printf 'Vendor: Ubuntu\nVendor-URL: https://www.ubuntu.com/\nParent: Debian\n' > "${CRAFT_PART_INSTALL}/usr/share/dpkg-origins/default"
-    stage:
-      - usr/bin/dpkg-mergechangelogs
-      - usr/share/perl5/Dpkg.pm
-      - usr/share/perl5/Dpkg
-      - usr/share/dpkg-origins
+      # Dpkg.pm has the system paths built in, point them at this snap through the current link
+      P="/snap/${CRAFT_PROJECT_NAME}/current"
+      sed -i "s|^our \$CONFDIR = '/etc/dpkg';|our \$CONFDIR = '$P/etc/dpkg';|; s|^our \$ADMINDIR = '/var/lib/dpkg';|our \$ADMINDIR = '$P/var/lib/dpkg';|; s|^our \$LIBDIR = '/usr/lib/dpkg';|our \$LIBDIR = '$P/usr/lib/dpkg';|; s|^our \$DATADIR = '/usr/share/dpkg';|our \$DATADIR = '$P/usr/share/dpkg';|" "$CRAFT_PRIME/usr/share/perl5/Dpkg.pm"
+      grep -c "$P" "$CRAFT_PRIME/usr/share/perl5/Dpkg.pm"
+      # dpkg-source runs tar -xf - to extract and tar -cf - to build, bsdtar only for the first
+      sed -i "s|^our \$PROGTAR = 'tar';|our \$PROGTAR = 'snap-tar';|" "$CRAFT_PRIME/usr/share/perl5/Dpkg.pm"
+      cat > "$CRAFT_PRIME/usr/bin/snap-tar" <<'WRAPPER'
+      #!/bin/sh
+      # bsdtar does not know the GNU matching options that dpkg-source adds when it unpacks
+      if [ "$1" = "-xf" ]; then
+        n=$#
+        while [ "$n" -gt 0 ]; do
+          a=$1; shift; n=$((n - 1))
+          case "$a" in --anchored|--no-wildcards-match-slash) ;; *) set -- "$@" "$a" ;; esac
+        done
+        exec bsdtar "$@"
+      fi
+      exec tar "$@"
+      WRAPPER
+      chmod 755 "$CRAFT_PRIME/usr/bin/snap-tar"
+      # Dpkg::Vendor wants an origins file, a strict snap cannot read the base's
+      mkdir -p "$CRAFT_PRIME/etc/dpkg/origins" "$CRAFT_PRIME/var/lib/dpkg" "$CRAFT_PRIME/usr/share/dpkg-origins"
+      printf 'Vendor: Ubuntu\nVendor-URL: https://www.ubuntu.com/\nParent: Debian\n' > "$CRAFT_PRIME/etc/dpkg/origins/default"
+      cp "$CRAFT_PRIME/etc/dpkg/origins/default" "$CRAFT_PRIME/usr/share/dpkg-origins/default"
+      touch "$CRAFT_PRIME/var/lib/dpkg/status"
+      # the real dpkg stops at start (it reads /etc/dpkg/dpkg.cfg.d), dpkg-dev only asks it for the architecture
+      rm -f "$CRAFT_PRIME/usr/bin/dpkg"
+      cat > "$CRAFT_PRIME/usr/bin/dpkg" <<'WRAPPER'
+      #!/bin/sh
+      case "$1" in
+        --print-architecture)
+          case "$(uname -m)" in
+            x86_64) echo amd64 ;; aarch64) echo arm64 ;; riscv64) echo riscv64 ;; armv7l) echo armhf ;;
+            ppc64le) echo ppc64el ;; s390x) echo s390x ;; i?86) echo i386 ;;
+            *) echo "dpkg: unknown machine $(uname -m)" >&2; exit 1 ;;
+          esac ;;
+        --print-foreign-architectures) ;;
+        *) echo "dpkg: $1 is not available inside this snap" >&2; exit 2 ;;
+      esac
+      WRAPPER
+      chmod 755 "$CRAFT_PRIME/usr/bin/dpkg"
+      # the base has no perl, scripts must find the staged one through PATH
+      for f in $(grep -rlI '^#!/usr/bin/perl' "$CRAFT_PRIME/usr/bin" "$CRAFT_PRIME/usr/sbin" 2>/dev/null); do
+        sed -i '1s|^#!/usr/bin/perl|#!/usr/bin/env -S perl|' "$f"
+      done

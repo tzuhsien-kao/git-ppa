@@ -10,7 +10,7 @@ readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-dependencies = ["python-debian"]
+dependencies = ["python-debian", "paramiko"]
 
 [project.optional-dependencies]
 test = ["pytest"]
