@@ -105,11 +105,23 @@ def _default_gitconfig(env: dict[str, str]) -> None:
     env["GIT_CONFIG_GLOBAL"] = str(cfg)
 
 
+TIMEOUT = 900
+
+# a connection that dies without a reset (a laptop that sleeps, a network that changes) leaves git
+# waiting forever, abort a transfer that stays under 1 kB/s for a minute
+LOW_SPEED_LIMIT, LOW_SPEED_TIME = "1000", "60"
+
+
 def _env() -> dict[str, str]:
     env = dict(os.environ)
     env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("GIT_HTTP_LOW_SPEED_LIMIT", LOW_SPEED_LIMIT)
+    env.setdefault("GIT_HTTP_LOW_SPEED_TIME", LOW_SPEED_TIME)
     # only for a downstream that is reached over ssh, the snap does not carry an ssh client
-    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=20")
+    env.setdefault(
+        "GIT_SSH_COMMAND",
+        "ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4",
+    )
     if env.get("SNAP"):
         _default_gitconfig(env)
     return env
@@ -133,15 +145,33 @@ def _credential_args() -> list[str]:
     return args
 
 
-def run(*args: str, cwd: str | Path | None = None, check: bool = True, timeout: int = 900, input_: str | None = None) -> subprocess.CompletedProcess:
+def run(*args: str, cwd: str | Path | None = None, check: bool = True, timeout: int = TIMEOUT, input_: str | None = None) -> subprocess.CompletedProcess:
     env = _env()
+    cmd = [_git_command(env), "-c", "commit.gpgsign=false", *_credential_args(), *args]
     try:
-        p = subprocess.run(
-            [_git_command(env), "-c", "commit.gpgsign=false", *_credential_args(), *args],
-            cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, input=input_,
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, env=env, text=True,
+            stdin=subprocess.PIPE if input_ is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
     except FileNotFoundError:
         raise ToolMissing(f"git not found, {HINTS['git']}") from None
+    try:
+        stdout, stderr = proc.communicate(input_, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # SIGTERM, not SIGKILL, so git removes its lock files. Its transport helpers can still hold our
+        # pipes, so wait for git itself and drop the pipes, the helpers end on their own (stall detection)
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        for f in (proc.stdin, proc.stdout, proc.stderr):
+            if f:
+                f.close()
+        raise GitError(args, -1, f"git timed out after {timeout} s") from None
+    p = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
     if check and p.returncode != 0:
         raise GitError(args, p.returncode, p.stderr + _auth_hint(p.stderr))
     return p

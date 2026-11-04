@@ -168,6 +168,10 @@ The snap can only read files under the home directory, so use a workspace there.
 - Launchpad errors that go away on their own (an https 502, an ssh connection closed) are not
   retried, run the command again. Over `git+ssh` Launchpad refuses several parallel connections,
   use `status --jobs 1`.
+- A connection that dies without being closed (a laptop that sleeps, a network change) is given up
+  after a minute under 1 kB/s (`GIT_HTTP_LOW_SPEED_LIMIT` and `GIT_HTTP_LOW_SPEED_TIME` change it),
+  and every git call stops after 15 minutes. Lock files that an interrupted run left in the `status`
+  cache are removed once they are older than that.
 - `status` skips the base version of packages marked `large` in the profile, add `--include-large`
   to read them, the first fetch is slow.
 - `merge start` leaves a conflicted tree for you to resolve. `merge finish`, building and uploading

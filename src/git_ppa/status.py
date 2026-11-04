@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import time
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -45,6 +46,24 @@ def _bare(repo: Path, *args: str, check: bool = True):
     return gitutil.run("--git-dir", str(repo), *args, check=check)
 
 
+def clear_stale_locks(repo: Path, max_age: float = gitutil.TIMEOUT + 60) -> list[Path]:
+    """Remove lock files older than any run of this tool can last, from a cache repository.
+
+    A git that was killed (not stopped) leaves its lock files, and every later fetch then fails.
+    The cache belongs to this tool, a lock older than the git timeout cannot belong to a live fetch.
+    """
+    now = time.time()
+    gone = []
+    for lock in repo.glob("**/*.lock"):
+        try:
+            if now - lock.stat().st_mtime > max_age:
+                lock.unlink()
+                gone.append(lock)
+        except FileNotFoundError:
+            pass
+    return gone
+
+
 def downstream_top_version(profile: Profile, pkg: Package, series: str, lpuser: str, refresh: bool) -> str:
     """Top version of debian/changelog on the downstream branch, through a shallow cached fetch."""
     names = profile.names(pkg, series)
@@ -54,6 +73,7 @@ def downstream_top_version(profile: Profile, pkg: Package, series: str, lpuser: 
     if not repo.exists():
         repo.mkdir(parents=True)
         _bare(repo, "init", "--bare", "-q")
+    clear_stale_locks(repo)
     remote = gitutil.out("ls-remote", url, ref)
     if not remote:
         raise gitutil.GitError(("ls-remote", ref), 2, f"branch {names['downstream']} not found")

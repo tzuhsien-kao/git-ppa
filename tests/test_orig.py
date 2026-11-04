@@ -221,3 +221,76 @@ def test_a_token_from_the_environment_is_not_in_the_arguments(tmp_path, monkeypa
         out = fill(f"git.launchpad.net/{repo}")
         assert "username=bot" in out and "password=ci-token" in out
     assert "ci-token" not in fill(f"example.com/{REPO_A}")
+
+
+def test_git_gets_stall_detection_and_ssh_keepalive_by_default(monkeypatch):
+    for k in ("GIT_HTTP_LOW_SPEED_LIMIT", "GIT_HTTP_LOW_SPEED_TIME", "GIT_SSH_COMMAND"):
+        monkeypatch.delenv(k, raising=False)
+    env = gitutil._env()
+    assert (env["GIT_HTTP_LOW_SPEED_LIMIT"], env["GIT_HTTP_LOW_SPEED_TIME"]) == ("1000", "60")
+    assert "ServerAliveInterval=15" in env["GIT_SSH_COMMAND"]
+    monkeypatch.setenv("GIT_HTTP_LOW_SPEED_TIME", "5")
+    assert gitutil._env()["GIT_HTTP_LOW_SPEED_TIME"] == "5"
+
+
+def test_a_stalled_https_server_makes_git_give_up_instead_of_waiting_forever(monkeypatch):
+    import http.server
+    import threading
+    import time
+
+    class Stall(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-git-upload-pack-advertisement")
+            self.end_headers()
+            self.wfile.write(b"001e# service=git-upload-pack\n")
+            self.wfile.flush()
+            time.sleep(30)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Stall)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.delenv("SNAP", raising=False)
+    monkeypatch.setenv("GIT_HTTP_LOW_SPEED_TIME", "2")
+    try:
+        t = time.monotonic()
+        with pytest.raises(gitutil.GitError) as e:
+            gitutil.run("ls-remote", f"http://127.0.0.1:{srv.server_address[1]}/repo", timeout=25)
+        took = time.monotonic() - t
+    finally:
+        srv.shutdown()
+    assert took < 15, took
+    assert "timed out after" not in str(e.value)
+
+
+def test_a_timeout_stops_git_with_sigterm_so_it_can_remove_its_locks(tmp_path, monkeypatch):
+    import time
+    snap = tmp_path / "snap"
+    (snap / "usr/bin").mkdir(parents=True)
+    lock = tmp_path / "shallow.lock"
+    exe = snap / "usr/bin/git"
+    exe.write_text(f'#!/bin/sh\ntouch {lock}\ntrap "rm -f {lock}; exit 143" TERM\nsleep 30 &\nwait\n')
+    exe.chmod(0o755)
+    monkeypatch.setenv("SNAP", str(snap))
+    t = time.monotonic()
+    with pytest.raises(gitutil.GitError, match="timed out after 1 s"):
+        gitutil.run("fetch", timeout=1)
+    assert time.monotonic() - t < 8
+    assert not lock.exists()
+
+
+def test_old_locks_in_the_cache_are_removed_and_fresh_ones_are_kept(tmp_path):
+    import os
+    import time
+    from git_ppa import status
+    repo = tmp_path / "pkg.git"
+    (repo / "refs/heads").mkdir(parents=True)
+    old, fresh = repo / "shallow.lock", repo / "refs/heads/x.lock"
+    old.write_text(""), fresh.write_text("")
+    hour_ago = time.time() - 3600
+    os.utime(old, (hour_ago, hour_ago))
+    assert status.clear_stale_locks(repo) == [old]
+    assert not old.exists() and fresh.exists()
