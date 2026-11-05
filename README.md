@@ -51,12 +51,46 @@ intercepted by git.
 | `orig [package]` | Fetch the orig tarball of the base version from Launchpad, verify its checksum, and name it for the downstream source |
 | `login [package...]` | Store a Launchpad access token for private repositories, one at a prompt, or many from a JSON file or standard input with `--from-file` |
 | `logout [package...]` | Remove stored tokens |
+| `update-package [config.yaml]` | All the steps for one package in order: clone, merge, finish, build, upload to a staging PPA, wait for the build, then stop for review. See below |
 
-Global options: `--profile FILE` (or `GIT_PPA_PROFILE`), `--series`, `--lpuser` (or
-`GIT_PPA_LPUSER`), `--json`, `-C DIR`.
+Global options: `--profile FILE` (also `--skillset`, or `GIT_PPA_PROFILE`), `--series`, `--lp-user`
+(also `--lpuser`, or `GIT_PPA_LPUSER`), `--json`, `-C DIR`.
 
 Exit codes: 0 ok, 1 error or lint failure, 2 `status --check` found a package behind, 3 `merge start`
-stopped with conflicts, 4 refused by a safety check.
+or `update-package` stopped with conflicts, 4 refused by a safety check, 5 `update-package` uploaded
+and the build is not over yet.
+
+### `update-package`
+
+The same interface as the `update-package` draft of a shared packaging tool, for the part git-ppa
+does: the base comes from git-ubuntu, the new version from the Ubuntu archive, the build happens in a
+PPA. Every option can also be given in a YAML file with the same names, the command line wins.
+
+```
+git ppa update-package --skillset acme --pkg-name hello-acme --ppa-name acme-staging \
+    --lp-user acme-bot --sign-key-file - --ssh-key-file ~/.ssh/acme-bot < signing.key
+```
+
+```yaml
+# config.yaml
+skillset: acme            # a profile file, or a name in the GIT_PPA_SKILLSETS directory
+pkg-name: hello-acme
+ppa-name: acme-staging    # must be in [safety] allow_ppas, and is never the package's target PPA
+lp-user: acme-bot
+manual-review: true       # the default
+wait: 3600
+```
+
+- The run works in `./<package>` and refuses a directory that exists. It records each finished step
+  in the repository, `--continue DIR` goes on from there: after conflicts were resolved and committed
+  (exit 3), after a build that was still running (exit 5), or after an error. A version already in the
+  staging PPA is not uploaded again.
+- `merge finish` counts the versions of the target and of the staging PPA.
+- It always stops after the build in the staging PPA. With `--manual-review` (the default) that is the
+  review before `promote`, which is not implemented yet.
+- `--base` other than `git-ubuntu`, `--from` other than `archive`, `--build` other than `ppa`, and
+  `--ai-model`, `--review-model`, `--budget`, `--bug`, `--ppa-dependencies` are refused, not ignored.
+  The staging PPA is not created, it must exist.
 
 ### How `merge start` judges a merge
 

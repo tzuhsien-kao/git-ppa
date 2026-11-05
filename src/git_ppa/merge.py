@@ -488,7 +488,9 @@ def _lint_errors_at(ref: str, profile: Profile, pkg: Package, repo: Path) -> set
 
 
 def merge_finish(profile: Profile, pkg: Package, series: str, repo: Path, me: bool = False,
-                 dry_run: bool = False, skip_ppa_check: bool = False, when: datetime | None = None) -> Finish:
+                 dry_run: bool = False, skip_ppa_check: bool = False, when: datetime | None = None,
+                 also_check: tuple[str, ...] = ()) -> Finish:
+    """also_check: more PPAs whose used versions count, the staging PPA of update-package."""
     names = profile.names(pkg, series)
     old_ref = f"old/{profile.tag}"
     warnings: list[str] = []
@@ -521,6 +523,10 @@ def merge_finish(profile: Profile, pkg: Package, series: str, repo: Path, me: bo
         warnings.append(f"versions already used in {ref} were not checked (--skip-ppa-check)")
     else:
         warnings.append("the profile names no target PPA for this package, versions used there were not checked")
+    if not skip_ppa_check:
+        for other in also_check:
+            if other != ref:
+                used |= lp.ppa_versions(other, pkg.name)
     version, kept = versions.choose_version(target, previous, profile.tag, pkg.in_archive, used)
 
     sep = "+" if pkg.in_archive else "~"

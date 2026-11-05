@@ -12,7 +12,7 @@ import re
 import sys
 from pathlib import Path
 
-from . import __version__, build as build_mod, credentials, gitutil, lint, lp, merge, orig, profile as profile_mod, signing, status, upload as upload_mod, versions, workspace
+from . import __version__, build as build_mod, credentials, gitutil, lint, lp, merge, orig, profile as profile_mod, signing, status, update, upload as upload_mod, versions, workspace
 
 
 class CliError(Exception):
@@ -27,7 +27,7 @@ def _lpuser(args: argparse.Namespace) -> str:
             if p.returncode == 0 and p.stdout.strip():
                 return p.stdout.strip()
     if not user:
-        raise CliError("no Launchpad user, use --lpuser, GIT_PPA_LPUSER or git config gitppa.lpuser")
+        raise CliError("no Launchpad user, use --lp-user, GIT_PPA_LPUSER or git config gitppa.lpuser")
     return user
 
 
@@ -37,9 +37,14 @@ def _user_for(args: argparse.Namespace, prof: profile_mod.Profile) -> str:
 
 
 def _profile(args: argparse.Namespace) -> profile_mod.Profile:
-    path = args.profile or os.environ.get("GIT_PPA_PROFILE")
+    path = getattr(args, "profile", None) or os.environ.get("GIT_PPA_PROFILE")
     if not path:
-        raise CliError("no profile, use --profile FILE or GIT_PPA_PROFILE")
+        raise CliError("no profile, use --profile FILE (or --skillset) or GIT_PPA_PROFILE")
+    # a skillset given by name is a profile in the GIT_PPA_SKILLSETS directory
+    if not Path(path).exists() and "/" not in path and os.environ.get("GIT_PPA_SKILLSETS"):
+        named = Path(os.environ["GIT_PPA_SKILLSETS"]) / f"{path}.toml"
+        if named.is_file():
+            path = str(named)
     return profile_mod.load(path)
 
 
@@ -71,6 +76,44 @@ def _target(profile: profile_mod.Profile, pkg: profile_mod.Package, args: argpar
 
 def _emit(args: argparse.Namespace, data, text: str) -> None:
     print(json.dumps(data, indent=2) if args.json else text)
+
+
+def _bool(text: str) -> bool:
+    v = str(text).lower()
+    if v in ("true", "yes", "1", "on"):
+        return True
+    if v in ("false", "no", "0", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"{text!r} is not true or false")
+
+
+def cmd_update_package(args: argparse.Namespace) -> int:
+    if args.config:
+        for dest, value in update.load_config(args.config).items():
+            # the command line wins over config.yaml
+            if getattr(args, dest, None) is None:
+                setattr(args, dest, value)
+    prof = _profile(args)
+    if not args.pkg_name:
+        raise CliError("--pkg-name is needed")
+    pkg = prof.package(args.pkg_name)
+    series = getattr(args, "series", None) or prof.series[0]
+    build_list = args.build if isinstance(args.build, list) else [x.strip() for x in (args.build or "ppa").split(",") if x.strip()]
+    o = update.Options(
+        pkg_name=pkg.name, ppa_name=args.ppa_name or "", build=build_list,
+        **{k: getattr(args, k) for k in ("base", "source", "manual_review", "wait", "sign_key_file", "ssh_key_file",
+                                          "ai_model", "review_model", "budget", "bug", "ppa_dependencies")
+           if getattr(args, k) is not None},
+        me=bool(args.me), skip_ppa_check=bool(args.skip_ppa_check),
+    )
+    if isinstance(o.manual_review, str):
+        o.manual_review = _bool(o.manual_review)
+    update.check(o)
+    workdir = Path(args.workdir or pkg.name).resolve()
+    res = update.run(prof, pkg, series, o, workdir, resume=bool(args.workdir), lpuser=_lpuser(args),
+                     log=lambda m: print(m, file=sys.stderr))
+    _emit(args, res.to_dict(), update.render(res))
+    return res.code
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -327,9 +370,9 @@ class _Parser(argparse.ArgumentParser):
 def _common(p: argparse.ArgumentParser, sub: bool) -> None:
     """Global options. On a subcommand an absent option must not override one given before it."""
     d = argparse.SUPPRESS if sub else None
-    p.add_argument("--profile", default=d, help="profile file, or GIT_PPA_PROFILE")
+    p.add_argument("--profile", "--skillset", dest="profile", default=d, help="profile file (or a name in GIT_PPA_SKILLSETS), or GIT_PPA_PROFILE")
     p.add_argument("--series", default=d, help="Ubuntu series, default is the first one in the profile")
-    p.add_argument("--lpuser", default=d, help="Launchpad user, or GIT_PPA_LPUSER")
+    p.add_argument("--lp-user", "--lpuser", dest="lpuser", default=d, help="Launchpad user, or GIT_PPA_LPUSER")
     p.add_argument("--json", action="store_true", default=argparse.SUPPRESS if sub else False, help="machine readable output")
     p.add_argument("-C", dest="directory", default=d, help="run in this repository")
 
@@ -405,6 +448,24 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--host-fingerprint", action="append", default=[], metavar="SHA256:...", help="for tests only")
     s.set_defaults(func=cmd_upload)
 
+    s = add("update-package", "the update-package interface: clone, merge, finish, build, upload to a staging PPA, wait")
+    s.add_argument("config", nargs="?", help="config.yaml with the same options, the command line wins")
+    s.add_argument("--pkg-name", help="package of the profile")
+    s.add_argument("--base", help="git-ubuntu (the only one supported)")
+    s.add_argument("--from", dest="source", help="archive (the only one supported)")
+    s.add_argument("--ppa-name", help="staging PPA, a name of the profile's owner or ~owner/ubuntu/name, it must be in [safety] allow_ppas")
+    s.add_argument("--build", help="ppa (the only one supported)")
+    s.add_argument("--manual-review", type=_bool, nargs="?", const=True, help="true (default): stop before promote for a review")
+    s.add_argument("--continue", dest="workdir", metavar="DIR", help="go on with the run in DIR")
+    s.add_argument("--wait", type=int, metavar="SECONDS", help="how long to wait for the build in the staging PPA, default 3600")
+    s.add_argument("--sign-key-file", metavar="FILE", help="exported secret signing key, a file (mode 600) or -, passphrase in GIT_PPA_GPG_PASSPHRASE")
+    s.add_argument("--ssh-key-file", metavar="FILE", help="ssh private key registered on Launchpad, a file (mode 600) or -, passphrase in GIT_PPA_SSH_PASSPHRASE")
+    s.add_argument("--me", action="store_true", default=None, help="sign the changelog entry with DEBFULLNAME and DEBEMAIL")
+    s.add_argument("--skip-ppa-check", action="store_true", default=None, help="do not read the versions already used in the PPAs")
+    for name in ("--ai-model", "--review-model", "--budget", "--bug", "--ppa-dependencies"):
+        s.add_argument(name, help="in the spec, not supported by git-ppa yet")
+    s.set_defaults(func=cmd_update_package)
+
     s = add("lint", "check packaging rules")
     s.add_argument("package", nargs="?")
     s.add_argument("--rule", action="append")
@@ -425,6 +486,6 @@ def main(argv: list[str] | None = None) -> int:
     except merge.Refused as e:
         print(f"refused: {e}", file=sys.stderr)
         return 4
-    except (CliError, profile_mod.ProfileError, workspace.WorkspaceError, orig.OrigError, lp.LaunchpadError, gitutil.GitError, gitutil.ToolMissing, build_mod.BuildError, signing.SigningError, upload_mod.UploadError) as e:
+    except (CliError, profile_mod.ProfileError, workspace.WorkspaceError, orig.OrigError, lp.LaunchpadError, gitutil.GitError, gitutil.ToolMissing, build_mod.BuildError, signing.SigningError, upload_mod.UploadError, update.UpdateError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

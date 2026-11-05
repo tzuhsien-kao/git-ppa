@@ -96,6 +96,14 @@ class Profile:
             return pkg.ppa
         return f"~{self.ppa_owner}/ubuntu/{pkg.ppa}" if self.ppa_owner else None
 
+    def ppa_ref(self, name: str) -> str:
+        """A PPA given as ~owner/ubuntu/name or as a name of the profile's owner."""
+        if name.startswith("~"):
+            return name
+        if not self.ppa_owner:
+            raise ProfileError(f"PPA {name!r} has no owner, write ~owner/ubuntu/{name} or set [ppa] owner")
+        return f"~{self.ppa_owner}/ubuntu/{name}"
+
     def binary_suffix(self) -> str:
         return self.expand(self.rename_suffix)
 
