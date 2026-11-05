@@ -252,9 +252,12 @@ The snap can only read files under the home directory, so use a workspace there.
 
 ## Known limits
 
-- Launchpad errors that go away on their own (an https 502, an ssh connection closed) are not
-  retried, run the command again. Over `git+ssh` Launchpad refuses several parallel connections,
-  use `status --jobs 1`.
+- git network commands (clone, fetch, ls-remote, push) are tried three times when git reports an
+  error that goes away on its own (an https 502 to 504, "Path translation timed out", a name that
+  does not resolve). Launchpad API reads are tried three times too. Over `git+ssh` Launchpad refuses
+  several parallel connections, use `status --jobs 1`.
+- Launchpad can take hours between the end of a build and the published binaries ("Uploading
+  build"). `update-package` then stops with exit 5, run it again later with `--continue`.
 - A connection that dies without being closed (a laptop that sleeps, a network change) is given up
   after a minute under 1 kB/s (`GIT_HTTP_LOW_SPEED_LIMIT` and `GIT_HTTP_LOW_SPEED_TIME` change it),
   and every git call stops after 15 minutes. Lock files that an interrupted run left in the `status`

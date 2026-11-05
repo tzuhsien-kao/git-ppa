@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from . import credentials
@@ -145,7 +146,40 @@ def _credential_args() -> list[str]:
     return args
 
 
+NETWORK = {"clone", "fetch", "ls-remote", "push"}
+# what git prints when Launchpad or the network fails for a moment, seen in real runs
+TRANSIENT = re.compile(
+    r"HTTP (502|503|504)|returned error: 5\d\d|Path translation timed out|RPC failed|early EOF|"
+    r"expected flush after ref listing|Connection reset|Connection timed out|Could not resolve host|"
+    r"Failed to connect|the remote end hung up unexpectedly|Operation timed out"
+)
+RETRY_DELAYS = (10, 30)
+
+
+def _subcommand(args: tuple[str, ...]) -> str | None:
+    it = iter(args)
+    for a in it:
+        if a in ("--git-dir", "-C", "-c"):
+            next(it, None)
+        elif not a.startswith("-"):
+            return a
+    return None
+
+
 def run(*args: str, cwd: str | Path | None = None, check: bool = True, timeout: int = TIMEOUT, input_: str | None = None) -> subprocess.CompletedProcess:
+    """git, with network commands tried again when the failure looks transient (an https 504 and the like)."""
+    delays = RETRY_DELAYS if _subcommand(args) in NETWORK else ()
+    for delay in (*delays, None):
+        p = _run_once(args, cwd, timeout, input_)
+        if p.returncode == 0 or delay is None or not TRANSIENT.search(p.stderr or ""):
+            break
+        time.sleep(delay)
+    if check and p.returncode != 0:
+        raise GitError(args, p.returncode, p.stderr + _auth_hint(p.stderr))
+    return p
+
+
+def _run_once(args: tuple[str, ...], cwd, timeout: int, input_: str | None) -> subprocess.CompletedProcess:
     env = _env()
     cmd = [_git_command(env), "-c", "commit.gpgsign=false", *_credential_args(), *args]
     try:
@@ -171,10 +205,7 @@ def run(*args: str, cwd: str | Path | None = None, check: bool = True, timeout: 
             if f:
                 f.close()
         raise GitError(args, -1, f"git timed out after {timeout} s") from None
-    p = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
-    if check and p.returncode != 0:
-        raise GitError(args, p.returncode, p.stderr + _auth_hint(p.stderr))
-    return p
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 def run_bytes(*args: str, cwd: str | Path | None = None, timeout: int = TIMEOUT) -> bytes:

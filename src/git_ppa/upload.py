@@ -162,7 +162,16 @@ def wait(ppa: str, source: str, version: str, seconds: int, every: int = 15, log
     last: dict | None = None
     seen = None
     while True:
-        last = publication(ppa, source, version)
+        try:
+            now = publication(ppa, source, version)
+        except lp.LaunchpadError as e:
+            # a name lookup or a 5xx that outlasted the retries, keep waiting with what was seen
+            log(f"Launchpad did not answer ({e}), still waiting")
+            now = None
+        # Launchpad answers from database replicas that can lag, a publication seen once can be
+        # missing from the next answer, it has not gone away
+        if now is not None:
+            last = now
         state = None if last is None else (last["status"], tuple((b["arch"], b["state"]) for b in last["builds"]))
         if state != seen:
             log("not published yet" if last is None else f"{last['status']}: " + (", ".join(f"{b['arch']} {b['state']}" for b in last["builds"]) or "no build yet"))

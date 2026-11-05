@@ -220,3 +220,22 @@ def test_skillset_by_name_is_a_profile_in_the_skillsets_directory(tmp_path, monk
     monkeypatch.setattr(update, "run", lambda prof, pkg, *a, **k: update.Result(pkg.name, "w", stopped=prof.tag))
     assert cli.main(["update-package", "--skillset", "acme", "--pkg-name", "hello-acme", "--ppa-name", "~a/ubuntu/s", "--lp-user", "u"]) == 0
     assert "acme" in capsys.readouterr().out
+
+
+def test_a_clone_that_fails_leaves_no_directory_so_the_run_can_start_again(prof, tmp_path, world, env, monkeypatch):
+    from git_ppa import gitutil, workspace
+    pkg, opts, *_ = env
+    new_version(world, {"debian/changelog": NEW_ENTRY + CHANGELOG_V1})
+    real = workspace.clone
+
+    def broken(prof_, pkg_, series, user, dest):
+        dest.mkdir(parents=True)
+        raise gitutil.GitError(["fetch", "pkg"], 128, "HTTP 504")
+
+    monkeypatch.setattr(workspace, "clone", broken)
+    w = tmp_path / "w"
+    with pytest.raises(gitutil.GitError):
+        go(prof, pkg, opts, w)
+    assert not w.exists()
+    monkeypatch.setattr(workspace, "clone", real)
+    assert go(prof, pkg, opts, w).code == 0

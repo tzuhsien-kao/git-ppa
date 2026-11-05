@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -166,7 +167,12 @@ def run(prof: Profile, pkg: Package, series: str, o: Options, workdir: Path, res
             raise UpdateError(f"{workdir} already exists, use --continue {workdir} to go on with it")
         r.target = _newest_target(prof, pkg, series)
         log(f"clone {pkg.name} into {workdir}")
-        workspace.clone(prof, pkg, series, lpuser, workdir)
+        try:
+            workspace.clone(prof, pkg, series, lpuser, workdir)
+        except BaseException:
+            # half a clone has no state, it could neither be started again nor continued
+            shutil.rmtree(workdir, ignore_errors=True)
+            raise
         r.done.append("clone")
         _save(workdir, r)
     repo = workdir

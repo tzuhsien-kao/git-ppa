@@ -220,3 +220,36 @@ def test_changelog_entry_is_a_valid_wrapped_debian_entry():
     assert (b.package, str(b.version), b.distributions, b.urgency) == ("hello-acme", "1.0-2+acme1", "resolute", "medium")
     assert b.author == "Bot <bot@example.com>" and b.date == "Wed, 04 Nov 2026 09:00:00 +0000"
     assert "CVE-2026-00011" in "\n".join(b.changes())
+
+
+def test_network_git_is_tried_again_on_a_transient_launchpad_error_only(monkeypatch):
+    import subprocess as sp
+    import pytest
+    from git_ppa import gitutil
+    answers = []
+    calls = []
+
+    def once(args, cwd, timeout, input_):
+        calls.append(args)
+        rc, err = answers.pop(0)
+        return sp.CompletedProcess(["git", *args], rc, "", err)
+
+    monkeypatch.setattr(gitutil, "_run_once", once)
+    monkeypatch.setattr(gitutil.time, "sleep", lambda s: None)
+    busy = "remote: Path translation timed out.\nfatal: unable to access 'https://git.launchpad.net/x/': The requested URL returned error: 504"
+    answers[:] = [(128, busy), (128, "error: RPC failed; HTTP 504 curl 22"), (0, "")]
+    assert gitutil.run("clone", "-q", "u", "d").returncode == 0 and len(calls) == 3
+    calls.clear()
+    answers[:] = [(128, busy)] * 3
+    with pytest.raises(gitutil.GitError, match="504"):
+        gitutil.run("--git-dir", "/c", "fetch", "-q", "u")
+    assert len(calls) == 3
+    calls.clear()
+    answers[:] = [(128, "fatal: repository 'u' not found")]
+    with pytest.raises(gitutil.GitError):
+        gitutil.run("ls-remote", "u")
+    assert len(calls) == 1
+    calls.clear()
+    # a local command is never tried again, even with the same words in its error
+    answers[:] = [(1, busy)]
+    assert gitutil.run("merge", "x", check=False).returncode == 1 and len(calls) == 1

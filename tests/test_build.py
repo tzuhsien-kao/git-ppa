@@ -298,6 +298,26 @@ def test_private_keys_load_from_openssh_and_pem_and_a_locked_key_is_explained():
         upload.load_private_key(b"junk")
 
 
+def test_wait_keeps_what_it_saw_when_launchpad_lags_or_does_not_answer(monkeypatch):
+    built = {"status": "Published", "builds": [{"arch": "amd64", "state": "Successfully built", "link": "w"}]}
+    pending = {"status": "Pending", "builds": [{"arch": "amd64", "state": "Needs building", "link": "w"}]}
+    answers = [None, pending, None, lp.LaunchpadError("name resolution"), pending, built]
+    seen = []
+
+    def publication(ppa, source, version):
+        a = answers.pop(0)
+        if isinstance(a, Exception):
+            raise a
+        return a
+
+    monkeypatch.setattr(upload, "publication", publication)
+    monkeypatch.setattr(upload.time, "sleep", lambda s: None)
+    assert upload.wait("~a/ubuntu/b", "src", "1-1", 60, every=1, log=seen.append) == built
+    # the first empty answer is the starting state, the one after Pending is a lagging replica, neither is logged
+    assert seen == ["Pending: amd64 Needs building",
+                    "Launchpad did not answer (name resolution), still waiting", "Published: amd64 Successfully built"]
+
+
 def test_publication_ignores_other_versions_and_does_not_ask_for_exact_match(monkeypatch):
     urls = []
     other = '{"source_package_name": "src", "source_package_version": "1-10", "status": "Published", "self_link": "https://x/o"}'
