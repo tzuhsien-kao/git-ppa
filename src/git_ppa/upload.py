@@ -129,7 +129,8 @@ def upload(changes: Path, ppa: str, user: str, private_key: paramiko.PKey, host:
         sftp = client.open_sftp()
         for n in names:
             # the .changes is last, Launchpad starts on a upload when it arrives
-            sftp.put(str(changes.parent / n), f"{target}/{n}")
+            # confirm=False: the Launchpad server cannot stat an uploaded file, put would fail with "size mismatch ... None"
+            sftp.put(str(changes.parent / n), f"{target}/{n}", confirm=False)
     except (OSError, paramiko.SSHException) as e:
         raise UploadError(f"upload failed{' at ' + n if n else ''}: {e}") from None
     finally:
@@ -141,8 +142,10 @@ def publication(ppa: str, source: str, version: str) -> dict | None:
     """Publication and builds of one source version in a public PPA, None while Launchpad has not made it."""
     m = re.fullmatch(r"~([^/]+)/ubuntu/([^/]+)", ppa)
     base = f"{lp.API}/~{m[1]}/+archive/ubuntu/{m[2]}"
-    q = urllib.parse.urlencode({"ws.op": "getPublishedSources", "source_name": source, "version": version, "exact_match": "true"})
-    entries = json.loads(lp._get(f"{base}?{q}")).get("entries", [])
+    q = urllib.parse.urlencode({"ws.op": "getPublishedSources", "source_name": source, "version": version})
+    # exact_match=true makes Launchpad return nothing here, so compare the name and version ourselves
+    entries = [x for x in json.loads(lp._get(f"{base}?{q}")).get("entries", [])
+               if x["source_package_name"] == source and x["source_package_version"] == version]
     if not entries:
         return None
     e = entries[0]

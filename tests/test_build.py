@@ -298,9 +298,22 @@ def test_private_keys_load_from_openssh_and_pem_and_a_locked_key_is_explained():
         upload.load_private_key(b"junk")
 
 
+def test_publication_ignores_other_versions_and_does_not_ask_for_exact_match(monkeypatch):
+    urls = []
+    other = '{"source_package_name": "src", "source_package_version": "1-10", "status": "Published", "self_link": "https://x/o"}'
+
+    def get(url, retries=3):
+        urls.append(url)
+        return ('{"entries": [%s]}' % other).encode()
+
+    monkeypatch.setattr(lp, "_get", get)
+    assert upload.publication("~a/ubuntu/b", "src", "1-1") is None
+    assert "exact_match" not in urls[0] and "version=1-1" in urls[0]
+
+
 def test_publication_and_wait_follow_the_builds(monkeypatch):
     pages = {
-        "pub": '{"entries": [{"status": "Published", "pocket": "Release", "date_published": "d", "self_link": "https://x/pub1"}]}',
+        "pub": '{"entries": [{"source_package_name": "src", "source_package_version": "1-1", "status": "Published", "pocket": "Release", "date_published": "d", "self_link": "https://x/pub1"}]}',
         "builds": '{"entries": [{"arch_tag": "amd64", "buildstate": "%s", "web_link": "w"}]}',
     }
     states = iter(["Needs building", "Currently building", "Successfully built"])
