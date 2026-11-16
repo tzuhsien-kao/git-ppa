@@ -318,6 +318,28 @@ def test_wait_keeps_what_it_saw_when_launchpad_lags_or_does_not_answer(monkeypat
                     "Launchpad did not answer (name resolution), still waiting", "Published: amd64 Successfully built"]
 
 
+def test_wait_never_goes_back_to_a_state_it_has_left(monkeypatch):
+    def b(state, link="L1"):
+        return {"arch": "amd64", "state": state, "link": link}
+
+    def pub(status, *builds):
+        return {"status": status, "pocket": "Release", "date": None, "builds": list(builds)}
+
+    # built, then a stale replica says "Needs building" and drops the build, then a retry shows as a new link
+    answers = [pub("Pending", b("Currently building")), pub("Published", b("Successfully built")),
+               pub("Pending", b("Needs building")), pub("Pending"), pub("Published", b("Successfully built"))]
+    seen = []
+    monkeypatch.setattr(upload, "publication", lambda *a: answers.pop(0))
+    monkeypatch.setattr(upload.time, "sleep", lambda s: None)
+    last = upload.wait("~a/ubuntu/b", "src", "1-1", 60, every=1, log=seen.append)
+    assert last["status"] == "Published" and [x["state"] for x in last["builds"]] == ["Successfully built"]
+    assert seen == ["Pending: amd64 Currently building", "Published: amd64 Successfully built"]
+    assert len(answers) == 3
+    # a build of another link (a retry) is a new build and is waited for
+    got = upload.forward(pub("Published", b("Successfully built")), pub("Published", b("Needs building", "L2")))
+    assert [(x["link"], x["state"]) for x in got["builds"]] == [("L2", "Needs building"), ("L1", "Successfully built")]
+
+
 def test_publication_ignores_other_versions_and_does_not_ask_for_exact_match(monkeypatch):
     urls = []
     other = '{"source_package_name": "src", "source_package_version": "1-10", "status": "Published", "self_link": "https://x/o"}'

@@ -21,7 +21,7 @@ from . import build as build_mod, gitutil, lp, merge, signing, upload as upload_
 from .profile import Package, Profile
 
 STEPS = ("clone", "merge", "finish", "prepare", "sign", "upload", "wait")
-BUSY = ("Needs building", "Currently building", "Uploading build", "Dependency wait")
+BUSY = upload_mod.BUSY
 
 # exit codes, the others are those of the tool (0 ok, 1 error, 3 conflicts, 4 refused)
 BUILDING = 5

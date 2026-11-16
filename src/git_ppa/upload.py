@@ -156,6 +156,27 @@ def publication(ppa: str, source: str, version: str) -> dict | None:
     }
 
 
+BUSY = ("Needs building", "Currently building", "Uploading build", "Dependency wait")
+
+
+def forward(last: dict | None, now: dict | None) -> dict | None:
+    """The newer answer, but never a step back. Launchpad answers through several cache nodes that read
+    different database replicas, so a build that was seen as built can be reported as "Needs building" a moment
+    later (seen 2026-11-16). A finished build, a published source and a build that was listed stay as they were."""
+    if now is None or last is None:
+        return last if now is None else now
+    out = dict(now)
+    if last["status"] == "Published":
+        out["status"], out["date"] = last["status"], last.get("date") or now.get("date")
+    old = {b["link"]: b for b in last["builds"]}
+    builds = []
+    for b in now["builds"]:
+        was = old.pop(b["link"], None)
+        builds.append(was if was is not None and was["state"] not in BUSY else b)
+    out["builds"] = builds + list(old.values())
+    return out
+
+
 def wait(ppa: str, source: str, version: str, seconds: int, every: int = 15, log=print) -> dict | None:
     """Wait until the source is published and every build is over. Returns the last state seen."""
     end = time.monotonic() + seconds
@@ -168,15 +189,12 @@ def wait(ppa: str, source: str, version: str, seconds: int, every: int = 15, log
             # a name lookup or a 5xx that outlasted the retries, keep waiting with what was seen
             log(f"Launchpad did not answer ({e}), still waiting")
             now = None
-        # Launchpad answers from database replicas that can lag, a publication seen once can be
-        # missing from the next answer, it has not gone away
-        if now is not None:
-            last = now
+        last = forward(last, now)
         state = None if last is None else (last["status"], tuple((b["arch"], b["state"]) for b in last["builds"]))
         if state != seen:
             log("not published yet" if last is None else f"{last['status']}: " + (", ".join(f"{b['arch']} {b['state']}" for b in last["builds"]) or "no build yet"))
             seen = state
-        if last and last["builds"] and all(b["state"] not in ("Needs building", "Currently building", "Uploading build", "Dependency wait") for b in last["builds"]):
+        if last and last["builds"] and all(b["state"] not in BUSY for b in last["builds"]):
             return last
         if time.monotonic() >= end:
             return last
