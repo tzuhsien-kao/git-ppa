@@ -20,7 +20,7 @@ import yaml
 from . import build as build_mod, gitutil, lp, merge, signing, upload as upload_mod, versions, workspace
 from .profile import Package, Profile
 
-STEPS = ("clone", "merge", "finish", "build", "upload", "wait")
+STEPS = ("clone", "merge", "finish", "prepare", "sign", "upload", "wait")
 BUSY = ("Needs building", "Currently building", "Uploading build", "Dependency wait")
 
 # exit codes, the others are those of the tool (0 ok, 1 error, 3 conflicts, 4 refused)
@@ -40,8 +40,6 @@ class Options:
     build: list[str] = field(default_factory=lambda: ["ppa"])
     manual_review: bool = True
     wait: int = 3600
-    sign_key_file: str | None = None
-    ssh_key_file: str | None = None
     me: bool = False
     skip_ppa_check: bool = False
     # spec options git-ppa does not implement yet, kept so they can be refused
@@ -55,13 +53,14 @@ class Options:
 # option name as written on the command line and in config.yaml, and the Options field
 KEYS = {
     "pkg-name": "pkg_name", "ppa-name": "ppa_name", "base": "base", "from": "source", "build": "build",
-    "manual-review": "manual_review", "wait": "wait", "sign-key-file": "sign_key_file",
-    "ssh-key-file": "ssh_key_file", "me": "me", "skip-ppa-check": "skip_ppa_check",
+    "manual-review": "manual_review", "wait": "wait", "me": "me", "skip-ppa-check": "skip_ppa_check",
     "ai-model": "ai_model", "review-model": "review_model", "budget": "budget", "bug": "bug",
     "ppa-dependencies": "ppa_dependencies",
     # these belong to the whole tool, update-package passes them on
     "series": "series", "lp-user": "lpuser", "skillset": "profile", "continue": "workdir",
 }
+# update-package is the side an AI agent runs on, it never gets a key, `git ppa release` does
+KEY_OPTIONS = ("sign-key-file", "ssh-key-file")
 
 
 def load_config(path: str | Path) -> dict:
@@ -76,6 +75,8 @@ def load_config(path: str | Path) -> dict:
     out = {}
     for k, v in data.items():
         key = str(k).replace("_", "-")
+        if key in KEY_OPTIONS:
+            raise UpdateError(f"{p}: {k} does not belong in a config that an agent reads, keys are given to `git ppa release` only")
         if key not in KEYS:
             raise UpdateError(f"{p}: unknown option {k!r}, known: {', '.join(sorted(KEYS))}")
         if key == "build" and isinstance(v, str):
@@ -100,8 +101,6 @@ def check(o: Options) -> None:
         raise UpdateError(f"--build {','.join(o.build)} is not supported, git-ppa builds in a PPA only (--build ppa)")
     if not o.ppa_name:
         raise UpdateError("--ppa-name is needed, creating the staging PPA is not supported yet, name an existing one")
-    if o.sign_key_file == "-" and o.ssh_key_file == "-":
-        raise UpdateError("only one of --sign-key-file and --ssh-key-file can be read from standard input")
 
 
 @dataclass
@@ -116,9 +115,15 @@ class Result:
     code: int = 0
     merge: dict | None = None
     publication: dict | None = None
+    tree: str | None = None
+    manual_review: bool = True
+    series: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+STATE_FIELDS = ("package", "target", "version", "staging_ppa", "done", "tree", "manual_review", "series")
 
 
 def _state_path(repo: Path) -> Path:
@@ -127,7 +132,7 @@ def _state_path(repo: Path) -> Path:
 
 
 def _save(repo: Path, r: Result) -> None:
-    _state_path(repo).write_text(json.dumps({k: getattr(r, k) for k in ("package", "target", "version", "staging_ppa", "done")}, indent=2))
+    _state_path(repo).write_text(json.dumps({k: getattr(r, k) for k in STATE_FIELDS}, indent=2))
 
 
 def _load(repo: Path) -> dict:
@@ -144,14 +149,20 @@ def _newest_target(prof: Profile, pkg: Package, series: str) -> str:
     return newest.version
 
 
-def run(prof: Profile, pkg: Package, series: str, o: Options, workdir: Path, resume: bool, lpuser: str,
-        log: Callable[[str], None] = print) -> Result:
-    staging = prof.ppa_ref(o.ppa_name)
+def _check_staging(prof: Profile, pkg: Package, staging: str) -> None:
     if staging not in prof.allow_ppas:
         raise merge.Refused(f"{staging} is not in [safety] allow_ppas of the profile, the profile has to name every PPA it may write to")
     if staging == prof.ppa_reference(pkg):
         raise merge.Refused(f"{staging} is the target PPA of {pkg.name}, update-package uploads to a staging PPA and the target is reached by promote")
-    r = Result(pkg.name, str(workdir), staging_ppa=staging)
+
+
+def prepare(prof: Profile, pkg: Package, series: str, o: Options, workdir: Path, resume: bool, lpuser: str,
+            log: Callable[[str], None] = print) -> Result:
+    """Everything up to an unsigned source package. No key is read or needed here, this is the side an
+    AI agent can run. Signing and uploading are `release`, after a review of the tree it prints."""
+    staging = prof.ppa_ref(o.ppa_name)
+    _check_staging(prof, pkg, staging)
+    r = Result(pkg.name, str(workdir), staging_ppa=staging, manual_review=o.manual_review, series=series)
 
     if resume:
         if not (workdir / ".git").exists():
@@ -162,6 +173,7 @@ def run(prof: Profile, pkg: Package, series: str, o: Options, workdir: Path, res
         if state.get("staging_ppa") != staging:
             raise UpdateError(f"{workdir} was started for {state.get('staging_ppa')}, not {staging}")
         r.target, r.version, r.done = state.get("target"), state.get("version"), list(state.get("done", []))
+        r.tree = state.get("tree")
     else:
         if workdir.exists():
             raise UpdateError(f"{workdir} already exists, use --continue {workdir} to go on with it")
@@ -180,16 +192,6 @@ def run(prof: Profile, pkg: Package, series: str, o: Options, workdir: Path, res
     def step(name: str) -> None:
         r.done.append(name)
         _save(repo, r)
-
-    # the keys are read before anything is written, a missing key should not stop a run half way
-    secret = signing.read_secret(o.sign_key_file) if o.sign_key_file and "build" not in r.done else None
-    ssh_key = None
-    if "upload" not in r.done:
-        if not o.ssh_key_file:
-            raise UpdateError("--ssh-key-file FILE or - is needed for the upload to the staging PPA")
-        ssh_key = upload_mod.load_private_key(signing.read_secret(o.ssh_key_file), os.environ.get("GIT_PPA_SSH_PASSPHRASE"))
-    if "build" not in r.done and not secret:
-        raise UpdateError("--sign-key-file FILE or - is needed, Launchpad accepts signed uploads only")
 
     if "merge" not in r.done:
         names = prof.names(pkg, series)
@@ -221,39 +223,116 @@ def run(prof: Profile, pkg: Package, series: str, o: Options, workdir: Path, res
         log(f"changelog entry {fin.version}")
         step("finish")
 
-    if "build" not in r.done:
+    if "prepare" not in r.done:
+        built = build_mod.build(prof, pkg, series, repo)
+        r.tree = gitutil.out("rev-parse", "HEAD^{tree}", cwd=repo)
+        log(f"built the unsigned source package {built.changes}")
+        step("prepare")
+    r.stopped = prepared_message(r, workdir)
+    return r
+
+
+def prepared_message(r: Result, workdir: Path) -> str:
+    review = "" if not r.manual_review else " The production release will need --approve with this tree after you reviewed it."
+    return (f"prepared {r.version}, tree {r.tree}. Next, on the machine that holds the keys, build it in the staging PPA: "
+            f"git ppa release {workdir} --to staging --sign-key-file ... --ssh-key-file ...{review}")
+
+
+def release(prof: Profile, pkg: Package, series: str, workdir: Path, to: str, approve: str | None,
+            sign_key_file: str | None, ssh_key_file: str | None, wait: int, lpuser: str,
+            log: Callable[[str], None] = print) -> Result:
+    """Sign, upload and wait for the build, to the staging PPA or to the production PPA. The only place a key is
+    read, and it signs the tree that `prepare` recorded, nothing else.
+
+    Staging takes any registered key and needs no approval, it only shows that the tree builds on Launchpad.
+    Production is a new upload of the same source signed by the production key, so it builds again there, and
+    it needs the approval of the tree and a successful staging build."""
+    if to not in ("staging", "production"):
+        raise UpdateError("--to is staging or production")
+    if not (workdir / ".git").exists():
+        raise UpdateError(f"{workdir} is not a repository")
+    state = _load(workdir)
+    if state.get("package") != pkg.name:
+        raise UpdateError(f"{workdir} is an update of {state.get('package')}, not {pkg.name}")
+    if "prepare" not in state.get("done", []):
+        raise UpdateError(f"{workdir} is not prepared yet, run update-package --continue {workdir} first")
+    staging = state["staging_ppa"]
+    _check_staging(prof, pkg, staging)
+    r = Result(pkg.name, str(workdir), state.get("target"), state.get("version"), staging, list(state["done"]),
+               tree=state.get("tree"), manual_review=state.get("manual_review", True), series=state.get("series"))
+    repo = workdir
+    if to == "staging":
+        ppa, p = staging, ""
+    else:
+        ppa, p = prof.ppa_reference(pkg), "prod-"
+        if not ppa:
+            raise UpdateError(f"the profile names no production PPA for {pkg.name}")
+        if ppa not in prof.production_ppas:
+            raise merge.Refused(f"{ppa} is not in [safety] production_ppas of the profile, the profile has to name every production PPA")
+        if "wait" not in r.done:
+            raise UpdateError(f"the build in {staging} did not finish successfully, run release --to staging first")
+    s_sign, s_upload, s_wait = f"{p}sign", f"{p}upload", f"{p}wait"
+
+    def step(name: str) -> None:
+        r.done.append(name)
+        _save(repo, r)
+
+    if s_upload not in r.done:
+        # the tree is checked before any key is read: a changed or unreviewed tree must not reach a key
+        tree = gitutil.out("rev-parse", "HEAD^{tree}", cwd=repo)
+        if not gitutil.is_clean(repo) or tree != r.tree:
+            raise merge.Refused(f"{workdir} is not the tree that was prepared ({r.tree}), prepare again and review it")
+        if to == "production" and r.manual_review:
+            if not approve or len(approve) < 12 or not tree.startswith(approve.lower()):
+                raise merge.Refused(f"--approve {tree[:12]} is needed, it is the tree that was prepared and has to be the one that was reviewed")
+    secret = None
+    if s_sign not in r.done:
+        if not sign_key_file:
+            raise UpdateError("--sign-key-file FILE or - is needed, Launchpad accepts signed uploads only")
+        secret = signing.read_secret(sign_key_file)
+    ssh_key = None
+    if s_upload not in r.done:
+        if not ssh_key_file:
+            raise UpdateError(f"--ssh-key-file FILE or - is needed for the upload to {ppa}")
+        if sign_key_file == "-" and ssh_key_file == "-":
+            raise UpdateError("only one of --sign-key-file and --ssh-key-file can be read from standard input")
+        ssh_key = upload_mod.load_private_key(signing.read_secret(ssh_key_file), os.environ.get("GIT_PPA_SSH_PASSPHRASE"))
+
+    if s_sign not in r.done:
         with signing.Keyring(secret, os.environ.get("GIT_PPA_GPG_PASSPHRASE")) as key:
             built = build_mod.build(prof, pkg, series, repo, key)
+        if gitutil.out("rev-parse", "HEAD^{tree}", cwd=repo) != r.tree or not gitutil.is_clean(repo):
+            raise merge.Refused("the tree changed while it was being built, nothing was uploaded")
         log(f"built and signed {built.changes}")
-        step("build")
+        step(s_sign)
 
     changes = repo.parent / build_mod.changes_name(pkg.name, r.version or "")
-    if "upload" not in r.done:
+    if s_upload not in r.done:
         # a version can be uploaded once, a run that died after the upload must not try again
-        if r.version in lp.ppa_versions(staging, pkg.name):
-            log(f"{r.version} is already in {staging}")
+        if r.version in lp.ppa_versions(ppa, pkg.name):
+            log(f"{r.version} is already in {ppa}")
         else:
-            upload_mod.upload(changes, staging, lpuser, ssh_key)
-            log(f"uploaded to {staging}")
-        step("upload")
+            upload_mod.upload(changes, ppa, lpuser, ssh_key)
+            log(f"uploaded to {ppa}")
+        step(s_upload)
 
-    if "wait" not in r.done:
-        state = upload_mod.wait(staging, pkg.name, r.version or "", o.wait, log=log)
-        r.publication = state
-        if state is None or not state["builds"] or any(b["state"] in BUSY for b in state["builds"]):
-            r.stopped, r.code = f"not built yet after {o.wait} s, run again with --continue {workdir}", BUILDING
+    if s_wait not in r.done:
+        state_now = upload_mod.wait(ppa, pkg.name, r.version or "", wait, log=log)
+        r.publication = state_now
+        if state_now is None or not state_now["builds"] or any(b["state"] in BUSY for b in state_now["builds"]):
+            r.stopped, r.code = f"not built yet after {wait} s, run release --to {to} again with {workdir}", BUILDING
             return r
-        failed = [b for b in state["builds"] if b["state"] != "Successfully built"]
+        failed = [b for b in state_now["builds"] if b["state"] != "Successfully built"]
         if failed:
-            r.stopped, r.code = "the build failed in the staging PPA: " + ", ".join(f"{b['arch']} {b['state']} {b['link']}" for b in failed), 1
+            r.stopped, r.code = f"the build failed in {ppa}: " + ", ".join(f"{b['arch']} {b['state']} {b['link']}" for b in failed), 1
             return r
-        step("wait")
+        step(s_wait)
 
-    target_ppa = prof.ppa_reference(pkg) or "the target PPA"
-    if o.manual_review:
-        r.stopped = f"built in {staging}, waiting for a review before promote to {target_ppa} (promote is not implemented yet)"
+    if to == "staging":
+        r.stopped = (f"built in {staging}. Review it, then release to the production PPA with the production key: "
+                     f"git ppa release {workdir} --to production --approve {(r.tree or '')[:12]} --sign-key-file ... --ssh-key-file ...")
     else:
-        r.stopped = f"built in {staging}, promote to {target_ppa} is not implemented yet"
+        r.stopped = f"released: {r.version} is built in {ppa}"
     return r
 
 

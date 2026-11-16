@@ -101,7 +101,7 @@ def cmd_update_package(args: argparse.Namespace) -> int:
     build_list = args.build if isinstance(args.build, list) else [x.strip() for x in (args.build or "ppa").split(",") if x.strip()]
     o = update.Options(
         pkg_name=pkg.name, ppa_name=args.ppa_name or "", build=build_list,
-        **{k: getattr(args, k) for k in ("base", "source", "manual_review", "wait", "sign_key_file", "ssh_key_file",
+        **{k: getattr(args, k) for k in ("base", "source", "manual_review", "wait",
                                           "ai_model", "review_model", "budget", "bug", "ppa_dependencies")
            if getattr(args, k) is not None},
         me=bool(args.me), skip_ppa_check=bool(args.skip_ppa_check),
@@ -110,8 +110,23 @@ def cmd_update_package(args: argparse.Namespace) -> int:
         o.manual_review = _bool(o.manual_review)
     update.check(o)
     workdir = Path(args.workdir or pkg.name).resolve()
-    res = update.run(prof, pkg, series, o, workdir, resume=bool(args.workdir), lpuser=_lpuser(args),
-                     log=lambda m: print(m, file=sys.stderr))
+    res = update.prepare(prof, pkg, series, o, workdir, resume=bool(args.workdir), lpuser=_lpuser(args),
+                         log=lambda m: print(m, file=sys.stderr))
+    _emit(args, res.to_dict(), update.render(res))
+    return res.code
+
+
+def cmd_release(args: argparse.Namespace) -> int:
+    prof = _profile(args)
+    workdir = Path(args.directory_to_release).resolve()
+    state = update._load(workdir) if (workdir / ".git").exists() else {}
+    name = args.package or state.get("package")
+    if not name:
+        raise CliError(f"{workdir} is not a run of update-package")
+    pkg = prof.package(name)
+    series = getattr(args, "series", None) or state.get("series") or prof.series[0]
+    res = update.release(prof, pkg, series, workdir, args.to, args.approve, args.sign_key_file, args.ssh_key_file,
+                         args.wait, _lpuser(args), log=lambda m: print(m, file=sys.stderr))
     _emit(args, res.to_dict(), update.render(res))
     return res.code
 
@@ -448,7 +463,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--host-fingerprint", action="append", default=[], metavar="SHA256:...", help="for tests only")
     s.set_defaults(func=cmd_upload)
 
-    s = add("update-package", "the update-package interface: clone, merge, finish, build, upload to a staging PPA, wait")
+    s = add("update-package", "the update-package interface up to an unsigned source package, takes no key (the agent side, see release)")
     s.add_argument("config", nargs="?", help="config.yaml with the same options, the command line wins")
     s.add_argument("--pkg-name", help="package of the profile")
     s.add_argument("--base", help="git-ubuntu (the only one supported)")
@@ -458,13 +473,21 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--manual-review", type=_bool, nargs="?", const=True, help="true (default): stop before promote for a review")
     s.add_argument("--continue", dest="workdir", metavar="DIR", help="go on with the run in DIR")
     s.add_argument("--wait", type=int, metavar="SECONDS", help="how long to wait for the build in the staging PPA, default 3600")
-    s.add_argument("--sign-key-file", metavar="FILE", help="exported secret signing key, a file (mode 600) or -, passphrase in GIT_PPA_GPG_PASSPHRASE")
-    s.add_argument("--ssh-key-file", metavar="FILE", help="ssh private key registered on Launchpad, a file (mode 600) or -, passphrase in GIT_PPA_SSH_PASSPHRASE")
     s.add_argument("--me", action="store_true", default=None, help="sign the changelog entry with DEBFULLNAME and DEBEMAIL")
     s.add_argument("--skip-ppa-check", action="store_true", default=None, help="do not read the versions already used in the PPAs")
     for name in ("--ai-model", "--review-model", "--budget", "--bug", "--ppa-dependencies"):
         s.add_argument(name, help="in the spec, not supported by git-ppa yet")
     s.set_defaults(func=cmd_update_package)
+
+    s = add("release", "sign the prepared tree, upload it and wait for the build, to the staging or the production PPA (the only command that reads keys)")
+    s.add_argument("directory_to_release", metavar="DIR", help="the run directory that update-package prepared")
+    s.add_argument("--to", choices=["staging", "production"], default="staging", help="staging (default, any registered key) or production (needs --approve and the production key)")
+    s.add_argument("--package", dest="package", help="default is the package of the run")
+    s.add_argument("--approve", metavar="TREE", help="production: the first 12 or more characters of the tree hash that update-package printed and that you reviewed")
+    s.add_argument("--sign-key-file", metavar="FILE", help="exported secret signing key, a file (mode 600) or -, passphrase in GIT_PPA_GPG_PASSPHRASE")
+    s.add_argument("--ssh-key-file", metavar="FILE", help="ssh private key registered on Launchpad, a file (mode 600) or -, passphrase in GIT_PPA_SSH_PASSPHRASE")
+    s.add_argument("--wait", type=int, default=3600, metavar="SECONDS", help="how long to wait for the build in the staging PPA, default 3600")
+    s.set_defaults(func=cmd_release)
 
     s = add("lint", "check packaging rules")
     s.add_argument("package", nargs="?")

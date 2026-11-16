@@ -59,6 +59,7 @@ class Profile:
     changelog_name: str = ""
     changelog_email: str = ""
     allow_ppas: list[str] = field(default_factory=list)
+    production_ppas: list[str] = field(default_factory=list)
 
     def package(self, name: str) -> Package:
         if name in self.packages:
@@ -160,6 +161,7 @@ def from_dict(d: dict) -> Profile:
         changelog_name=d.get("changelog", {}).get("name", ""),
         changelog_email=d.get("changelog", {}).get("email", ""),
         allow_ppas=list(d.get("safety", {}).get("allow_ppas", [])),
+        production_ppas=list(d.get("safety", {}).get("production_ppas", [])),
     )
 
 

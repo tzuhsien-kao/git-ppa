@@ -60,34 +60,46 @@ Exit codes: 0 ok, 1 error or lint failure, 2 `status --check` found a package be
 or `update-package` stopped with conflicts, 4 refused by a safety check, 5 `update-package` uploaded
 and the build is not over yet.
 
-### `update-package`
+### `update-package` and `release`
 
 The same interface as the `update-package` draft of a shared packaging tool, for the part git-ppa
 does: the base comes from git-ubuntu, the new version from the Ubuntu archive, the build happens in a
-PPA. Every option can also be given in a YAML file with the same names, the command line wins.
+PPA. The work is split in two commands so that an AI agent can run the first and never gets a key:
 
 ```
-git ppa update-package --skillset acme --pkg-name hello-acme --ppa-name acme-staging \
-    --lp-user acme-bot --sign-key-file - --ssh-key-file ~/.ssh/acme-bot < signing.key
+git ppa update-package --skillset acme --pkg-name hello-acme --ppa-name acme-staging --lp-user acme-bot
+    # clone, merge, merge finish, unsigned source package. No key is read, none can be given.
+    # It prints the tree hash of what it prepared.
+
+git ppa release hello-acme --to staging --sign-key-file - --ssh-key-file ~/.ssh/staging < staging.key
+    # sign with a staging key, upload to the staging PPA, wait for the build. No approval.
+
+git ppa release hello-acme --to production --approve <tree> --sign-key-file - --ssh-key-file ~/.ssh/prod < prod.key
+    # sign the same tree again with the production key, upload to the production PPA, wait.
 ```
 
 ```yaml
-# config.yaml
+# config.yaml, only the options of update-package, never a key
 skillset: acme            # a profile file, or a name in the GIT_PPA_SKILLSETS directory
 pkg-name: hello-acme
-ppa-name: acme-staging    # must be in [safety] allow_ppas, and is never the package's target PPA
+ppa-name: acme-staging    # must be in [safety] allow_ppas, and is never the package's own PPA
 lp-user: acme-bot
 manual-review: true       # the default
 wait: 3600
 ```
 
+- Only `release` reads keys. The keys are read after the tree is checked, a tree that changed after
+  `prepare`, or an approval that does not match the tree, stops it before any key is read.
+- **Staging** only shows that the tree builds on Launchpad, so any registered key does and nothing has
+  to be approved. **Production** needs the approval of the tree (`--approve`, the first 12 or more
+  characters of the hash, unless `--manual-review=false`), a successful staging build, and a PPA named
+  in `[safety] production_ppas`. It is a new upload of the same source, signed by the production key,
+  so the package is built again in the production PPA. It is not a copy.
 - The run works in `./<package>` and refuses a directory that exists. It records each finished step
-  in the repository, `--continue DIR` goes on from there: after conflicts were resolved and committed
-  (exit 3), after a build that was still running (exit 5), or after an error. A version already in the
-  staging PPA is not uploaded again.
-- `merge finish` counts the versions of the target and of the staging PPA.
-- It always stops after the build in the staging PPA. With `--manual-review` (the default) that is the
-  review before `promote`, which is not implemented yet.
+  in the repository, `--continue DIR` goes on from there after conflicts were resolved and committed
+  (exit 3). `release` is run again after a build that was still running (exit 5) or an error. A version
+  already in the PPA is not uploaded again and a signed package is not signed again.
+- `merge finish` counts the versions used in the production and the staging PPA.
 - `--base` other than `git-ubuntu`, `--from` other than `archive`, `--build` other than `ppa`, and
   `--ai-model`, `--review-model`, `--budget`, `--bug`, `--ppa-dependencies` are refused, not ignored.
   The staging PPA is not created, it must exist.
@@ -195,8 +207,9 @@ owner = "acme-team"                # the package's ppa below is ~acme-team/ubunt
 name = "Acme Bot"
 email = "bot@example.com"
 
-[safety]                           # every PPA upload may write to, nothing else is accepted
-allow_ppas = ["~acme-team/ubuntu/acme-proposed"]
+[safety]                           # every PPA the tool may write to, nothing else is accepted
+allow_ppas = ["~acme-team/ubuntu/acme-staging", "~acme-team/ubuntu/acme-proposed"]
+production_ppas = ["~acme-team/ubuntu/acme-proposed"]   # the ones `release --to production` may reach
 
 [[package]]
 name = "hello-acme"
