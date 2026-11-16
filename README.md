@@ -51,58 +51,35 @@ intercepted by git.
 | `orig [package]` | Fetch the orig tarball of the base version from Launchpad, verify its checksum, and name it for the downstream source |
 | `login [package...]` | Store a Launchpad access token for private repositories, one at a prompt, or many from a JSON file or standard input with `--from-file` |
 | `logout [package...]` | Remove stored tokens |
-| `update-package [config.yaml]` | All the steps for one package in order: clone, merge, finish, build, upload to a staging PPA, wait for the build, then stop for review. See below |
+| `release [package]` | The human step: sign the reviewed tree, upload it to a PPA, wait for the build. See below |
 
-Global options: `--profile FILE` (also `--skillset`, or `GIT_PPA_PROFILE`), `--series`, `--lp-user`
+Global options: `--profile FILE` (or `GIT_PPA_PROFILE`), `--series`, `--lp-user`
 (also `--lpuser`, or `GIT_PPA_LPUSER`), `--json`, `-C DIR`.
 
 Exit codes: 0 ok, 1 error or lint failure, 2 `status --check` found a package behind, 3 `merge start`
-or `update-package` stopped with conflicts, 4 refused by a safety check, 5 `update-package` uploaded
-and the build is not over yet.
+stopped with conflicts, 4 refused by a safety check, 5 `release` uploaded and the build is not over yet.
 
-### `update-package` and `release`
+### `release`
 
-The same interface as the `update-package` draft of a shared packaging tool, for the part git-ppa
-does: the base comes from git-ubuntu, the new version from the Ubuntu archive, the build happens in a
-PPA. The work is split in two commands so that an AI agent can run the first and never gets a key:
+The step after a person has reviewed the result of `merge finish`. It is the only command that reads keys,
+so an agent can do everything before it (`status`, `clone`, `sync`, `merge`, `lint`, `build`) without any.
 
 ```
-git ppa update-package --skillset acme --pkg-name hello-acme --ppa-name acme-staging --lp-user acme-bot
-    # clone, merge, merge finish, unsigned source package. No key is read, none can be given.
-    # It prints the tree hash of what it prepared.
-
-git ppa release hello-acme --to staging --sign-key-file - --ssh-key-file ~/.ssh/staging < staging.key
-    # sign with a staging key, upload to the staging PPA, wait for the build. No approval.
-
-git ppa release hello-acme --to production --approve <tree> --sign-key-file - --ssh-key-file ~/.ssh/prod < prod.key
-    # sign the same tree again with the production key, upload to the production PPA, wait.
+git ppa -C hello-acme release --approve <tree> --sign-key-file - --ssh-key-file ~/.ssh/acme < signing.key
 ```
 
-```yaml
-# config.yaml, only the options of update-package, never a key
-skillset: acme            # a profile file, or a name in the GIT_PPA_SKILLSETS directory
-pkg-name: hello-acme
-ppa-name: acme-staging    # must be in [safety] allow_ppas, and is never the package's own PPA
-lp-user: acme-bot
-manual-review: true       # the default
-wait: 3600
-```
-
-- Only `release` reads keys. The keys are read after the tree is checked, a tree that changed after
-  `prepare`, or an approval that does not match the tree, stops it before any key is read.
-- **Staging** only shows that the tree builds on Launchpad, so any registered key does and nothing has
-  to be approved. **Production** needs the approval of the tree (`--approve`, the first 12 or more
-  characters of the hash, unless `--manual-review=false`), a successful staging build, and a PPA named
-  in `[safety] production_ppas`. It is a new upload of the same source, signed by the production key,
-  so the package is built again in the production PPA. It is not a copy.
-- The run works in `./<package>` and refuses a directory that exists. It records each finished step
-  in the repository, `--continue DIR` goes on from there after conflicts were resolved and committed
-  (exit 3). `release` is run again after a build that was still running (exit 5) or an error. A version
-  already in the PPA is not uploaded again and a signed package is not signed again.
-- `merge finish` counts the versions used in the production and the staging PPA.
-- `--base` other than `git-ubuntu`, `--from` other than `archive`, `--build` other than `ppa`, and
-  `--ai-model`, `--review-model`, `--budget`, `--bug`, `--ppa-dependencies` are refused, not ignored.
-  The staging PPA is not created, it must exist.
+- `--approve` is the first 12 or more characters of `git rev-parse HEAD^{tree}` of the commit that was
+  reviewed. The checkout must be committed and clean, and its tree must match, before any key is read.
+  The tree is checked again after the build and nothing is uploaded if it changed.
+- It signs the source package with the key given (a file or `-`, see above), uploads it with the ssh key,
+  and waits for the build (`--wait SECONDS`, default 3600). The PPA is the one of the package in the
+  profile, or `--ppa`, and it must be in `[safety] allow_ppas`.
+- A version is uploaded once per PPA. When the version is already there, `release` only waits and needs no
+  key, so exit 5 (the build is not over) is followed by running the same command again. A failed build
+  is exit 1 with the link.
+- To try a package before it goes to its real PPA, `release --ppa` a staging PPA first and give
+  `merge finish --also-check <staging PPA>` so its version numbers are counted. Which key signs for which
+  PPA is up to whoever runs it, and a person or a CI job that holds the keys decides who may approve.
 
 ### How `merge start` judges a merge
 
@@ -208,8 +185,7 @@ name = "Acme Bot"
 email = "bot@example.com"
 
 [safety]                           # every PPA the tool may write to, nothing else is accepted
-allow_ppas = ["~acme-team/ubuntu/acme-staging", "~acme-team/ubuntu/acme-proposed"]
-production_ppas = ["~acme-team/ubuntu/acme-proposed"]   # the ones `release --to production` may reach
+allow_ppas = ["~acme-team/ubuntu/acme-proposed"]
 
 [[package]]
 name = "hello-acme"
@@ -270,7 +246,7 @@ The snap can only read files under the home directory, so use a workspace there.
   does not resolve). Launchpad API reads are tried three times too. Over `git+ssh` Launchpad refuses
   several parallel connections, use `status --jobs 1`.
 - Launchpad can take hours between the end of a build and the published binaries ("Uploading
-  build"). `update-package` then stops with exit 5, run it again later with `--continue`.
+  build"). `release` then stops with exit 5, run it again later.
 - A connection that dies without being closed (a laptop that sleeps, a network change) is given up
   after a minute under 1 kB/s (`GIT_HTTP_LOW_SPEED_LIMIT` and `GIT_HTTP_LOW_SPEED_TIME` change it),
   and every git call stops after 15 minutes. Lock files that an interrupted run left in the `status`

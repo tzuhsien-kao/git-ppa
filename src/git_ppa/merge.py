@@ -490,7 +490,7 @@ def _lint_errors_at(ref: str, profile: Profile, pkg: Package, repo: Path) -> set
 def merge_finish(profile: Profile, pkg: Package, series: str, repo: Path, me: bool = False,
                  dry_run: bool = False, skip_ppa_check: bool = False, when: datetime | None = None,
                  also_check: tuple[str, ...] = ()) -> Finish:
-    """also_check: more PPAs whose used versions count, the staging PPA of update-package."""
+    """also_check: more PPAs whose used versions count, for example a staging PPA."""
     names = profile.names(pkg, series)
     old_ref = f"old/{profile.tag}"
     warnings: list[str] = []

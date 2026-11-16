@@ -216,6 +216,16 @@ def test_merge_finish_adds_the_entry_lints_and_commits(prof, tmp_path, world, mo
         merge.merge_finish(prof, pkg, "resolute", repo)
 
 
+def test_merge_finish_counts_the_versions_of_the_other_ppas_it_is_told_about(prof, tmp_path, world, monkeypatch):
+    pkg, repo = prepare(prof, tmp_path, world, {})
+    assert merge.merge_start(prof, pkg, "resolute", repo, V2).merged
+    _, calls = _finish_profile(prof, monkeypatch, used={"1.0-1ubuntu1.1+acme1"})
+    f = merge.merge_finish(prof, pkg, "resolute", repo, also_check=("~acme/ubuntu/acme-staging", "~acme/ubuntu/acme-proposed"))
+    # the staging PPA is read as well, the target is not read twice, a version used in either is skipped
+    assert [c[0] for c in calls] == ["~acme/ubuntu/acme-proposed", "~acme/ubuntu/acme-staging"]
+    assert f.version == "1.0-1ubuntu1.1+acme2"
+
+
 def test_merge_finish_keeps_the_base_when_the_archive_appended_letters(prof, tmp_path, world, monkeypatch):
     entry = NEW_ENTRY.replace("1.0-1ubuntu1.1", "1.0-1ubuntu1build1")
     new_version(world, {"debian/changelog": entry + CHANGELOG_V1}, "1.0-1ubuntu1build1")

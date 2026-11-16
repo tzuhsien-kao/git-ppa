@@ -12,7 +12,7 @@ import re
 import sys
 from pathlib import Path
 
-from . import __version__, build as build_mod, credentials, gitutil, lint, lp, merge, orig, profile as profile_mod, signing, status, update, upload as upload_mod, versions, workspace
+from . import __version__, build as build_mod, credentials, gitutil, lint, lp, merge, orig, profile as profile_mod, release as release_mod, signing, status, upload as upload_mod, versions, workspace
 
 
 class CliError(Exception):
@@ -39,12 +39,7 @@ def _user_for(args: argparse.Namespace, prof: profile_mod.Profile) -> str:
 def _profile(args: argparse.Namespace) -> profile_mod.Profile:
     path = getattr(args, "profile", None) or os.environ.get("GIT_PPA_PROFILE")
     if not path:
-        raise CliError("no profile, use --profile FILE (or --skillset) or GIT_PPA_PROFILE")
-    # a skillset given by name is a profile in the GIT_PPA_SKILLSETS directory
-    if not Path(path).exists() and "/" not in path and os.environ.get("GIT_PPA_SKILLSETS"):
-        named = Path(os.environ["GIT_PPA_SKILLSETS"]) / f"{path}.toml"
-        if named.is_file():
-            path = str(named)
+        raise CliError("no profile, use --profile FILE or GIT_PPA_PROFILE")
     return profile_mod.load(path)
 
 
@@ -76,59 +71,6 @@ def _target(profile: profile_mod.Profile, pkg: profile_mod.Package, args: argpar
 
 def _emit(args: argparse.Namespace, data, text: str) -> None:
     print(json.dumps(data, indent=2) if args.json else text)
-
-
-def _bool(text: str) -> bool:
-    v = str(text).lower()
-    if v in ("true", "yes", "1", "on"):
-        return True
-    if v in ("false", "no", "0", "off"):
-        return False
-    raise argparse.ArgumentTypeError(f"{text!r} is not true or false")
-
-
-def cmd_update_package(args: argparse.Namespace) -> int:
-    if args.config:
-        for dest, value in update.load_config(args.config).items():
-            # the command line wins over config.yaml
-            if getattr(args, dest, None) is None:
-                setattr(args, dest, value)
-    prof = _profile(args)
-    if not args.pkg_name:
-        raise CliError("--pkg-name is needed")
-    pkg = prof.package(args.pkg_name)
-    series = getattr(args, "series", None) or prof.series[0]
-    build_list = args.build if isinstance(args.build, list) else [x.strip() for x in (args.build or "ppa").split(",") if x.strip()]
-    o = update.Options(
-        pkg_name=pkg.name, ppa_name=args.ppa_name or "", build=build_list,
-        **{k: getattr(args, k) for k in ("base", "source", "manual_review", "wait",
-                                          "ai_model", "review_model", "budget", "bug", "ppa_dependencies")
-           if getattr(args, k) is not None},
-        me=bool(args.me), skip_ppa_check=bool(args.skip_ppa_check),
-    )
-    if isinstance(o.manual_review, str):
-        o.manual_review = _bool(o.manual_review)
-    update.check(o)
-    workdir = Path(args.workdir or pkg.name).resolve()
-    res = update.prepare(prof, pkg, series, o, workdir, resume=bool(args.workdir), lpuser=_lpuser(args),
-                         log=lambda m: print(m, file=sys.stderr))
-    _emit(args, res.to_dict(), update.render(res))
-    return res.code
-
-
-def cmd_release(args: argparse.Namespace) -> int:
-    prof = _profile(args)
-    workdir = Path(args.directory_to_release).resolve()
-    state = update._load(workdir) if (workdir / ".git").exists() else {}
-    name = args.package or state.get("package")
-    if not name:
-        raise CliError(f"{workdir} is not a run of update-package")
-    pkg = prof.package(name)
-    series = getattr(args, "series", None) or state.get("series") or prof.series[0]
-    res = update.release(prof, pkg, series, workdir, args.to, args.approve, args.sign_key_file, args.ssh_key_file,
-                         args.wait, _lpuser(args), log=lambda m: print(m, file=sys.stderr))
-    _emit(args, res.to_dict(), update.render(res))
-    return res.code
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -165,6 +107,20 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_release(args: argparse.Namespace) -> int:
+    prof = _profile(args)
+    repo = _repo(args)
+    pkg = _pkg(prof, args, repo)
+    series = args.series or prof.series[0]
+    ppa = prof.ppa_ref(args.ppa) if args.ppa else prof.ppa_reference(pkg)
+    if not ppa:
+        raise CliError("no target PPA, the package has none in the profile, use --ppa NAME or ~owner/ubuntu/name")
+    res = release_mod.release(prof, pkg, series, repo, ppa, args.approve, args.sign_key_file, args.ssh_key_file,
+                              args.wait, _lpuser(args), log=lambda m: print(m, file=sys.stderr))
+    _emit(args, res.to_dict(), release_mod.render(res))
+    return res.code
+
+
 def cmd_merge(args: argparse.Namespace) -> int:
     prof = _profile(args)
     repo = _repo(args)
@@ -176,7 +132,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
         return 0
     if args.action == "finish":
         try:
-            fin = merge.merge_finish(prof, pkg, series, repo, me=args.me, dry_run=args.dry_run, skip_ppa_check=args.skip_ppa_check)
+            fin = merge.merge_finish(prof, pkg, series, repo, me=args.me, dry_run=args.dry_run, skip_ppa_check=args.skip_ppa_check,
+                                  also_check=tuple(prof.ppa_ref(n) for n in args.also_check))
         except merge.LintFailed as e:
             print(f"error: {e}", file=sys.stderr)
             print(lint.render(e.findings), file=sys.stderr)
@@ -385,7 +342,7 @@ class _Parser(argparse.ArgumentParser):
 def _common(p: argparse.ArgumentParser, sub: bool) -> None:
     """Global options. On a subcommand an absent option must not override one given before it."""
     d = argparse.SUPPRESS if sub else None
-    p.add_argument("--profile", "--skillset", dest="profile", default=d, help="profile file (or a name in GIT_PPA_SKILLSETS), or GIT_PPA_PROFILE")
+    p.add_argument("--profile", default=d, help="profile file, or GIT_PPA_PROFILE")
     p.add_argument("--series", default=d, help="Ubuntu series, default is the first one in the profile")
     p.add_argument("--lp-user", "--lpuser", dest="lpuser", default=d, help="Launchpad user, or GIT_PPA_LPUSER")
     p.add_argument("--json", action="store_true", default=argparse.SUPPRESS if sub else False, help="machine readable output")
@@ -431,6 +388,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dry-run", action="store_true", help="finish: show the version and the entry, write nothing")
     s.add_argument("--me", action="store_true", help="finish: sign the entry with DEBFULLNAME and DEBEMAIL, not the bot identity of the profile")
     s.add_argument("--skip-ppa-check", action="store_true", help="finish: do not read the versions already used in the target PPA")
+    s.add_argument("--also-check", action="append", default=[], metavar="PPA", help="finish: count the versions used in this PPA too, for example a staging PPA (repeatable)")
     s.set_defaults(func=cmd_merge)
 
     s = add("login", "store a Launchpad access token for the repositories of some packages")
@@ -463,30 +421,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--host-fingerprint", action="append", default=[], metavar="SHA256:...", help="for tests only")
     s.set_defaults(func=cmd_upload)
 
-    s = add("update-package", "the update-package interface up to an unsigned source package, takes no key (the agent side, see release)")
-    s.add_argument("config", nargs="?", help="config.yaml with the same options, the command line wins")
-    s.add_argument("--pkg-name", help="package of the profile")
-    s.add_argument("--base", help="git-ubuntu (the only one supported)")
-    s.add_argument("--from", dest="source", help="archive (the only one supported)")
-    s.add_argument("--ppa-name", help="staging PPA, a name of the profile's owner or ~owner/ubuntu/name, it must be in [safety] allow_ppas")
-    s.add_argument("--build", help="ppa (the only one supported)")
-    s.add_argument("--manual-review", type=_bool, nargs="?", const=True, help="true (default): stop before promote for a review")
-    s.add_argument("--continue", dest="workdir", metavar="DIR", help="go on with the run in DIR")
-    s.add_argument("--wait", type=int, metavar="SECONDS", help="how long to wait for the build in the staging PPA, default 3600")
-    s.add_argument("--me", action="store_true", default=None, help="sign the changelog entry with DEBFULLNAME and DEBEMAIL")
-    s.add_argument("--skip-ppa-check", action="store_true", default=None, help="do not read the versions already used in the PPAs")
-    for name in ("--ai-model", "--review-model", "--budget", "--bug", "--ppa-dependencies"):
-        s.add_argument(name, help="in the spec, not supported by git-ppa yet")
-    s.set_defaults(func=cmd_update_package)
-
-    s = add("release", "sign the prepared tree, upload it and wait for the build, to the staging or the production PPA (the only command that reads keys)")
-    s.add_argument("directory_to_release", metavar="DIR", help="the run directory that update-package prepared")
-    s.add_argument("--to", choices=["staging", "production"], default="staging", help="staging (default, any registered key) or production (needs --approve and the production key)")
-    s.add_argument("--package", dest="package", help="default is the package of the run")
-    s.add_argument("--approve", metavar="TREE", help="production: the first 12 or more characters of the tree hash that update-package printed and that you reviewed")
+    s = add("release", "the human step: sign the reviewed tree, upload it to a PPA and wait for the build")
+    s.add_argument("package", nargs="?")
+    s.add_argument("--ppa", help="PPA name of the profile's owner or ~owner/ubuntu/name, default is the PPA of the package in the profile, it must be in [safety] allow_ppas")
+    s.add_argument("--approve", metavar="TREE", help="the first 12 or more characters of the tree hash of the commit that was reviewed (git rev-parse HEAD^{tree})")
     s.add_argument("--sign-key-file", metavar="FILE", help="exported secret signing key, a file (mode 600) or -, passphrase in GIT_PPA_GPG_PASSPHRASE")
     s.add_argument("--ssh-key-file", metavar="FILE", help="ssh private key registered on Launchpad, a file (mode 600) or -, passphrase in GIT_PPA_SSH_PASSPHRASE")
-    s.add_argument("--wait", type=int, default=3600, metavar="SECONDS", help="how long to wait for the build in the staging PPA, default 3600")
+    s.add_argument("--wait", type=int, default=3600, metavar="SECONDS", help="how long to wait for the build, default 3600")
     s.set_defaults(func=cmd_release)
 
     s = add("lint", "check packaging rules")
@@ -509,6 +450,6 @@ def main(argv: list[str] | None = None) -> int:
     except merge.Refused as e:
         print(f"refused: {e}", file=sys.stderr)
         return 4
-    except (CliError, profile_mod.ProfileError, workspace.WorkspaceError, orig.OrigError, lp.LaunchpadError, gitutil.GitError, gitutil.ToolMissing, build_mod.BuildError, signing.SigningError, upload_mod.UploadError, update.UpdateError) as e:
+    except (CliError, profile_mod.ProfileError, workspace.WorkspaceError, orig.OrigError, lp.LaunchpadError, gitutil.GitError, gitutil.ToolMissing, build_mod.BuildError, signing.SigningError, upload_mod.UploadError, release_mod.ReleaseError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
