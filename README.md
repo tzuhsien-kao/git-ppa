@@ -10,8 +10,10 @@ rules.
 Everything specific to a project (package names, branches, PPAs, risk patterns, lint rules) lives in
 a profile file that you pass with `--profile`, so the tool itself is not tied to one project.
 
-**Status: prototype, phase 1.** The commands below only read from Launchpad and write to your local
-clones. Nothing is pushed to Launchpad, uploaded or published by the tool.
+**Status: prototype.** Most commands only read from Launchpad and write to your local clones. The
+exceptions are `upload` and `release`, which upload a signed source package to a PPA, and `release` is
+the one human step that signs the reviewed tree with the keys you give it. Nothing is pushed to the
+downstream git repositories by the tool.
 
 ## Install
 
