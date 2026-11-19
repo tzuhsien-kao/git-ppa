@@ -421,13 +421,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--host-fingerprint", action="append", default=[], metavar="SHA256:...", help="for tests only")
     s.set_defaults(func=cmd_upload)
 
-    s = add("release", "the human step: sign the reviewed tree, upload it to a PPA and wait for the build")
+    s = add("release", "the human step: sign the reviewed tree and upload it to a PPA")
     s.add_argument("package", nargs="?")
     s.add_argument("--ppa", help="PPA name of the profile's owner or ~owner/ubuntu/name, default is the PPA of the package in the profile, it must be in [safety] allow_ppas")
     s.add_argument("--approve", metavar="TREE", help="the first 12 or more characters of the tree hash of the commit that was reviewed (git rev-parse HEAD^{tree})")
     s.add_argument("--sign-key-file", metavar="FILE", help="exported secret signing key, a file (mode 600) or -, passphrase in GIT_PPA_GPG_PASSPHRASE")
     s.add_argument("--ssh-key-file", metavar="FILE", help="ssh private key registered on Launchpad, a file (mode 600) or -, passphrase in GIT_PPA_SSH_PASSPHRASE")
-    s.add_argument("--wait", type=int, default=3600, metavar="SECONDS", help="how long to wait for the build, default 3600")
+    s.add_argument("--wait", type=int, default=0, metavar="SECONDS", help="wait this long for the build, default 0 (upload and return, a build can take hours)")
     s.set_defaults(func=cmd_release)
 
     s = add("lint", "check packaging rules")

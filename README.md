@@ -53,13 +53,13 @@ intercepted by git.
 | `orig [package]` | Fetch the orig tarball of the base version from Launchpad, verify its checksum, and name it for the downstream source |
 | `login [package...]` | Store a Launchpad access token for private repositories, one at a prompt, or many from a JSON file or standard input with `--from-file` |
 | `logout [package...]` | Remove stored tokens |
-| `release [package]` | The human step: sign the reviewed tree, upload it to a PPA, wait for the build. See below |
+| `release [package]` | The human step: sign the reviewed tree and upload it to a PPA, `--wait` for the build is optional. See below |
 
 Global options: `--profile FILE` (or `GIT_PPA_PROFILE`), `--series`, `--lp-user`
 (also `--lpuser`, or `GIT_PPA_LPUSER`), `--json`, `-C DIR`.
 
 Exit codes: 0 ok, 1 error or lint failure, 2 `status --check` found a package behind, 3 `merge start`
-stopped with conflicts, 4 refused by a safety check, 5 `release` uploaded and the build is not over yet.
+stopped with conflicts, 4 refused by a safety check, 5 `release --wait` ran out of time with the build not over.
 
 ### `release`
 
@@ -73,12 +73,14 @@ git ppa -C hello-acme release --approve <tree> --sign-key-file - --ssh-key-file 
 - `--approve` is the first 12 or more characters of `git rev-parse HEAD^{tree}` of the commit that was
   reviewed. The checkout must be committed and clean, and its tree must match, before any key is read.
   The tree is checked again after the build and nothing is uploaded if it changed.
-- It signs the source package with the key given (a file or `-`, see above), uploads it with the ssh key,
-  and waits for the build (`--wait SECONDS`, default 3600). The PPA is the one of the package in the
-  profile, or `--ppa`, and it must be in `[safety] allow_ppas`.
-- A version is uploaded once per PPA. When the version is already there, `release` only waits and needs no
-  key, so exit 5 (the build is not over) is followed by running the same command again. A failed build
-  is exit 1 with the link.
+- It signs the source package with the key given (a file or `-`, see above) and uploads it with the ssh key,
+  then returns. A Launchpad build can take hours, so by default nothing waits for it (`--wait SECONDS`
+  is there for a short build) and the output says where to follow it. The PPA is the one of the package in
+  the profile, or `--ppa`, and it must be in `[safety] allow_ppas`.
+- A version is uploaded once per PPA. When a public PPA already has the version, `release` needs no key and
+  only looks at the state once, a failed build is exit 1 with the link. A private PPA cannot be read
+  anonymously, so there `release` assumes the version is new and Launchpad rejects a repeated upload (it
+  mails the uploader). With `--wait` that ran out the exit code is 5, run the same command again.
 - To try a package before it goes to its real PPA, `release --ppa` a staging PPA first and give
   `merge finish --also-check <staging PPA>` so its version numbers are counted. Which key signs for which
   PPA is up to whoever runs it, and a person or a CI job that holds the keys decides who may approve.

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""release: the human step. Sign what was reviewed, upload it to a PPA and wait for the build.
+"""release: the human step. Sign what was reviewed and upload it to a PPA, waiting for the build only when asked to.
 
 The reviewed thing is a tree hash. Nothing is signed, and no key is read, unless the checkout is clean and its
 tree is the one named by --approve. The agent side (merge, finish, build, lint) never needs a key.
@@ -16,7 +16,7 @@ from . import build as build_mod, gitutil, lp, merge, signing, upload as upload_
 from .profile import Package, Profile
 
 BUSY = upload_mod.BUSY
-# exit code of the command when the package is uploaded and the build is not over, the others are those of the tool
+# exit code of the command when it waited (--wait) and the build was not over, the others are those of the tool
 BUILDING = 5
 
 
@@ -59,7 +59,13 @@ def release(prof: Profile, pkg: Package, series: str, repo: Path, ppa: str, appr
     r = Released(pkg.name, version, ppa, tree)
 
     # a version is uploaded once per PPA, so a run that stopped after the upload only waits, with no key
-    if version in lp.ppa_versions(ppa, pkg.name):
+    try:
+        already = version in lp.ppa_versions(ppa, pkg.name)
+    except lp.LaunchpadError as e:
+        # a private PPA cannot be read anonymously, Launchpad rejects an upload of a version it already has
+        log(f"cannot read {ppa} ({e}), assuming {version} is not there")
+        already = False
+    if already:
         log(f"{version} is already in {ppa}")
     else:
         if not sign_key_file:
@@ -79,8 +85,15 @@ def release(prof: Profile, pkg: Package, series: str, repo: Path, ppa: str, appr
         r.uploaded = True
         log(f"uploaded to {ppa}")
 
+    if wait <= 0 and r.uploaded:
+        # a Launchpad build can take hours, so by default nothing waits for it, look at the PPA or run this again later
+        r.message = f"{version} is uploaded to {ppa}, the build is not awaited, follow it at {ppa_url(ppa)}"
+        return r
     state = upload_mod.wait(ppa, pkg.name, version, wait, log=log)
     r.publication = state
+    if wait <= 0 and (state is None or not state["builds"] or any(b["state"] in BUSY for b in state["builds"])):
+        r.message = f"{version} is in {ppa}, no finished build to report, follow it at {ppa_url(ppa)}"
+        return r
     if state is None or not state["builds"] or any(b["state"] in BUSY for b in state["builds"]):
         r.code, r.message = BUILDING, f"not built yet after {wait} s, run the same command again, no key is needed any more"
         return r
@@ -90,6 +103,11 @@ def release(prof: Profile, pkg: Package, series: str, repo: Path, ppa: str, appr
         return r
     r.message = f"{version} is built in {ppa}"
     return r
+
+
+def ppa_url(ppa: str) -> str:
+    owner, _, name = ppa.removeprefix("~").split("/")
+    return f"https://launchpad.net/~{owner}/+archive/ubuntu/{name}"
 
 
 def render(r: Released) -> str:

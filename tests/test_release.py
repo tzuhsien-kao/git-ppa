@@ -154,5 +154,33 @@ def test_the_cli_passes_the_options_and_takes_the_ppa_of_the_package(prof, env, 
     monkeypatch.setattr(release, "release", fake)
     argv = ["release", "-C", str(repo), "--approve", tree[:12], "--sign-key-file", "-", "--ssh-key-file", "k", "--lp-user", "bot"]
     assert cli.main(argv) == 5
-    assert seen == {"pkg": "hello-acme", "ppa": PPA, "approve": tree[:12], "sign": "-", "ssh": "k", "wait": 3600, "lpuser": "bot"}
+    assert seen == {"pkg": "hello-acme", "ppa": PPA, "approve": tree[:12], "sign": "-", "ssh": "k", "wait": 0, "lpuser": "bot"}
     assert cli.main(argv + ["--ppa", "other"]) == 5 and seen["ppa"] == "~acme/ubuntu/other"
+
+
+def test_by_default_nothing_waits_for_the_build_after_the_upload(prof, env):
+    calls = env[3]
+    r = go(prof, env, wait=0)
+    assert (r.code, r.uploaded) == (0, True) and calls["wait"] == 0
+    assert "the build is not awaited" in r.message and "https://launchpad.net/~acme/+archive/ubuntu/acme-proposed" in r.message
+
+
+def test_without_waiting_a_version_already_there_is_looked_at_once(prof, env):
+    calls, used, states = env[3], env[4], env[5]
+    used.add("1.0-1ubuntu1+acme1")
+    states.append({"status": "Pending", "builds": [{"arch": "amd64", "state": "Currently building", "link": "l"}]})
+    r = go(prof, env, sign=None, ssh=None, wait=0)
+    assert (r.code, r.uploaded, calls["wait"]) == (0, False, 1) and "follow it at" in r.message
+    states.append({"status": "Published", "builds": [{"arch": "amd64", "state": "Failed to build", "link": "https://b/1"}]})
+    assert go(prof, env, sign=None, ssh=None, wait=0).code == 1
+
+
+def test_a_private_ppa_that_cannot_be_read_is_uploaded_to_as_if_the_version_were_new(prof, env, monkeypatch):
+    calls = env[3]
+
+    def unreadable(ref, name):
+        raise lp.LaunchpadError("HTTP 404")
+
+    monkeypatch.setattr(lp, "ppa_versions", unreadable)
+    r = go(prof, env, wait=0)
+    assert (r.code, r.uploaded) == (0, True) and len(calls["upload"]) == 1

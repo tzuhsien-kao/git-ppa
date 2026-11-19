@@ -8,8 +8,8 @@ description: |
   downstream. It finds the newest version in the Release, Security and Updates
   pockets, merges it into the downstream git branch, classifies the result by
   conflict size and by the regions it touched, and checks packaging rules.
-  The last step, "release", is the human one: it signs the reviewed tree,
-  uploads it to a PPA and waits for the build.
+  The last step, "release", is the human one: it signs the reviewed tree and
+  uploads it to a PPA. It does not wait for the build unless asked to.
 
   Everything specific to a project (package names, branches, PPAs, risk
   patterns, lint rules) comes from a profile file that you pass with
