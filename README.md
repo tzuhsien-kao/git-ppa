@@ -14,7 +14,8 @@ a profile file that you pass with `--profile`, so the tool itself is not tied to
 
 **Status: prototype.** Most commands only read from Launchpad and write to your local clones. The
 exceptions are the optional helpers `upload` and `release`, which sign and upload a source package to a
-PPA with the keys you give them, the rest of the tool never reads a key. Nothing is pushed to the
+PPA with the keys you give them, the rest of the tool needs no signing or upload key, only a read-only token
+for each private repository. Nothing is pushed to the
 downstream git repositories by the tool.
 
 ## Install
@@ -67,8 +68,8 @@ stopped with conflicts, 4 refused by a safety check, 5 `release --wait` ran out 
 
 An optional helper, outside what the tool needs to prepare an update (a person can sign with `debsign` and upload
 with `dput` instead). It is for the step after a person has reviewed the result of `merge finish`, and with
-`upload` it is the only code that reads keys, so an agent can do everything before it (`status`, `clone`,
-`sync`, `merge`, `lint`, `build`) without any.
+`upload` it is the only code that reads signing and upload keys, so an agent can do everything before it
+(`status`, `clone`, `sync`, `merge`, `lint`, `build`) without any, with only the read-only repository tokens.
 
 ```
 git ppa -C hello-acme release --approve <tree> --sign-key-file - --ssh-key-file ~/.ssh/acme < signing.key
