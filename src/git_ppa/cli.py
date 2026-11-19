@@ -408,7 +408,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--sign-key-file", metavar="FILE", help="exported secret key, a file (mode 600) or - for standard input, the passphrase is read from GIT_PPA_GPG_PASSPHRASE")
     s.set_defaults(func=cmd_build)
 
-    s = add("upload", "upload a signed source package to a PPA over sftp")
+    s = add("upload", "optional helper: upload a signed source package to a PPA over sftp")
     s.add_argument("package", nargs="?")
     s.add_argument("--changes", help="default is the .changes of the newest version, next to the repository")
     s.add_argument("--ppa", help="~owner/ubuntu/name, default is the PPA of the package in the profile")
@@ -421,7 +421,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--host-fingerprint", action="append", default=[], metavar="SHA256:...", help="for tests only")
     s.set_defaults(func=cmd_upload)
 
-    s = add("release", "the human step: sign the reviewed tree and upload it to a PPA")
+    s = add("release", "optional helper for the human step: sign the reviewed tree and upload it to a PPA")
     s.add_argument("package", nargs="?")
     s.add_argument("--ppa", help="PPA name of the profile's owner or ~owner/ubuntu/name, default is the PPA of the package in the profile, it must be in [safety] allow_ppas")
     s.add_argument("--approve", metavar="TREE", help="the first 12 or more characters of the tree hash of the commit that was reviewed (git rev-parse HEAD^{tree})")

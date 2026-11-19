@@ -5,14 +5,16 @@ Keep a downstream PPA delta current with the Ubuntu archive.
 `git-ppa` treats the Ubuntu archive as the upstream and a Launchpad PPA as the downstream. It finds
 the newest version of a source package in the pockets you follow, merges it into the downstream git
 branch, classifies the result by conflict size and by the regions it touched, and checks packaging
-rules.
+rules. It prepares the update **up to a source package** and stops there. Testing the build, review,
+signing, publishing and merging the result are for a person or a packaging pipeline (the PE037 outcome
+is a package "ready for human intervention").
 
 Everything specific to a project (package names, branches, PPAs, risk patterns, lint rules) lives in
 a profile file that you pass with `--profile`, so the tool itself is not tied to one project.
 
 **Status: prototype.** Most commands only read from Launchpad and write to your local clones. The
-exceptions are `upload` and `release`, which upload a signed source package to a PPA, and `release` is
-the one human step that signs the reviewed tree with the keys you give it. Nothing is pushed to the
+exceptions are the optional helpers `upload` and `release`, which sign and upload a source package to a
+PPA with the keys you give them, the rest of the tool never reads a key. Nothing is pushed to the
 downstream git repositories by the tool.
 
 ## Install
@@ -53,7 +55,7 @@ intercepted by git.
 | `orig [package]` | Fetch the orig tarball of the base version from Launchpad, verify its checksum, and name it for the downstream source |
 | `login [package...]` | Store a Launchpad access token for private repositories, one at a prompt, or many from a JSON file or standard input with `--from-file` |
 | `logout [package...]` | Remove stored tokens |
-| `release [package]` | The human step: sign the reviewed tree and upload it to a PPA, `--wait` for the build is optional. See below |
+| `release [package]` | Optional helper for the human step: sign the reviewed tree and upload it to a PPA, `--wait` for the build is optional. See below |
 
 Global options: `--profile FILE` (or `GIT_PPA_PROFILE`), `--series`, `--lp-user`
 (also `--lpuser`, or `GIT_PPA_LPUSER`), `--json`, `-C DIR`.
@@ -63,8 +65,10 @@ stopped with conflicts, 4 refused by a safety check, 5 `release --wait` ran out 
 
 ### `release`
 
-The step after a person has reviewed the result of `merge finish`. It is the only command that reads keys,
-so an agent can do everything before it (`status`, `clone`, `sync`, `merge`, `lint`, `build`) without any.
+An optional helper, outside what the tool needs to prepare an update (a person can sign with `debsign` and upload
+with `dput` instead). It is for the step after a person has reviewed the result of `merge finish`, and with
+`upload` it is the only code that reads keys, so an agent can do everything before it (`status`, `clone`,
+`sync`, `merge`, `lint`, `build`) without any.
 
 ```
 git ppa -C hello-acme release --approve <tree> --sign-key-file - --ssh-key-file ~/.ssh/acme < signing.key

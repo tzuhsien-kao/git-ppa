@@ -8,8 +8,8 @@ description: |
   downstream. It finds the newest version in the Release, Security and Updates
   pockets, merges it into the downstream git branch, classifies the result by
   conflict size and by the regions it touched, and checks packaging rules.
-  The last step, "release", is the human one: it signs the reviewed tree and
-  uploads it to a PPA. It does not wait for the build unless asked to.
+  It prepares the update up to a source package and stops there, for a person
+  or a packaging pipeline to test, sign and publish.
 
   Everything specific to a project (package names, branches, PPAs, risk
   patterns, lint rules) comes from a profile file that you pass with
@@ -20,9 +20,9 @@ description: |
 
   The snap is strict and reaches the private downstream repositories over https. Create a
   Launchpad access token with the repository:pull scope for the project and store it with
-  "git ppa login". It builds and signs the source package and uploads
-  it to a PPA over sftp with the tools the snap carries, and the keys are passed to it as a file
-  or on standard input, never taken from the host.
+  "git ppa login". The optional "release" and "upload" helpers sign a source
+  package and upload it to a PPA over sftp with the tools the snap carries, the keys are
+  passed to them as a file or on standard input, never taken from the host.
 
 grade: devel
 confinement: strict
